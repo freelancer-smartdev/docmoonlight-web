@@ -1,4 +1,3 @@
-// components/ZoomMeetingComponent.jsx
 import { useEffect, useRef, useState } from 'react';
 import axios from 'axios';
 import ZoomVideo from '@zoom/videosdk';
@@ -22,59 +21,53 @@ function decodeJwtPayload(token) {
   }
 }
 
-/** Helper to normalize arrays from SDK events into arrays. */
-const asArray = (x) => (Array.isArray(x) ? x : x ? [x] : []);
-
-/** Nicely format the local display name. */
-const localDisplayName = (role, locationName) =>
-  role === 1 ? `Doctor – ${locationName || ''}` : `Clinic – ${locationName || ''}`;
-
 export default function ZoomMeetingComponent({
   callId,
   locationName,
-  role = 0,        // 0: participant (Clinic), 1: host (Doctor)
+  role = 0,          // 0 = participant (web)
   userId,
-  token,           // if provided via URL
+  token,            // optional: passed from mobile deep link
 }) {
-  // ---------- Refs ----------
+  // Refs
   const selfVideoRef = useRef(null);
   const selfLabelRef = useRef(null);
+  const remoteGridRef = useRef(null);
+
   const clientRef = useRef(null);
   const mediaRef = useRef(null);
 
   // uid -> { wrapper, canvas, label }
   const remoteTilesRef = useRef(new Map());
-  const remoteGridRef = useRef(null);
 
-  // ---------- State ----------
+  // State
   const [joining, setJoining] = useState(true);
   const [error, setError] = useState('');
+  const [needsGesture, setNeedsGesture] = useState(
+    typeof navigator !== 'undefined' && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+  );
 
-  // debug overlay (?debug=1)
+  // Debug overlay (?debug=1)
   const [debug, setDebug] = useState(false);
   const [debugLines, setDebugLines] = useState([]);
-
   useEffect(() => {
     if (typeof window !== 'undefined') {
       setDebug(new URLSearchParams(window.location.search).has('debug'));
     }
   }, []);
-
   const dbg = (msg, data) => {
     if (debug) {
       const line = `[VideoSDK] ${msg} ${data ? JSON.stringify(data) : ''}`;
-      setDebugLines((prev) => prev.concat(line).slice(-120));
+      setDebugLines((p) => p.concat(line).slice(-150));
     }
     if (data !== undefined) console.log('[VideoSDK]', msg, data);
     else console.log('[VideoSDK]', msg);
   };
 
-  // ---------- Remote tile helpers ----------
+  // ----- Remote tile helpers -----
   const ensureRemoteTile = (user) => {
     const uid = user.userId;
     let tile = remoteTilesRef.current.get(uid);
     if (tile) {
-      // update label if we learned the name later
       if (user.displayName && tile.label) tile.label.textContent = user.displayName;
       return tile;
     }
@@ -82,16 +75,16 @@ export default function ZoomMeetingComponent({
     const wrapper = document.createElement('div');
     Object.assign(wrapper.style, {
       position: 'relative',
+      width: '280px',
+      height: '180px',
       background: '#111',
       borderRadius: '12px',
       overflow: 'hidden',
-      minHeight: '180px',
       boxShadow: '0 2px 10px rgba(0,0,0,.35)',
-      display: 'grid',
     });
 
     const canvas = document.createElement('canvas');
-    canvas.width = 320;
+    canvas.width = 280;
     canvas.height = 180;
     Object.assign(canvas.style, {
       width: '100%',
@@ -127,34 +120,17 @@ export default function ZoomMeetingComponent({
       const client = clientRef.current;
       const media = mediaRef.current;
       if (!client || !media) return;
-
-      // ensure a tile + label exists no matter what
-      const user = (client.getAllUser() || []).find((u) => u.userId === uid) || { userId: uid };
+      const user = client.getAllUser()?.find((x) => x.userId === uid) || { userId: uid };
       const { canvas } = ensureRemoteTile(user);
-
-      // try to render only if they actually have video on
-      const target = (client.getAllUser() || []).find((u) => u.userId === uid);
-      const bVideoOn = !!target?.bVideoOn;
-
-      if (bVideoOn) {
-        await media.renderVideo(canvas, uid, 320, 180, 0, 0, 2);
-        dbg('remote.render ok', { uid });
-      } else {
-        // blank placeholder; nothing to render
-        const ctx = canvas.getContext('2d');
-        ctx.fillStyle = '#111';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        dbg('remote.noVideo placeholder', { uid });
-      }
+      await media.renderVideo(canvas, uid, 280, 180, 0, 0, 2);
+      dbg('remote.render ok', { uid });
     } catch (e) {
-      dbg('remote.render fail', { uid, err: e?.reason || e?.message || String(e) });
+      dbg('remote.render fail (keeping placeholder)', { uid, err: e?.reason || e?.message || String(e) });
     }
   };
 
   const stopRemoteRenderOnly = (uid) => {
-    try {
-      mediaRef.current?.stopRender(uid);
-    } catch { }
+    try { mediaRef.current?.stopRender(uid); } catch { }
     const tile = remoteTilesRef.current.get(uid);
     if (tile?.canvas) {
       const ctx = tile.canvas.getContext('2d');
@@ -172,7 +148,7 @@ export default function ZoomMeetingComponent({
     }
   };
 
-  // ---------- Join & events ----------
+  // ----- Join flow -----
   useEffect(() => {
     if (!callId && !token) return;
     let mounted = true;
@@ -182,22 +158,20 @@ export default function ZoomMeetingComponent({
         setError('');
         setJoining(true);
 
-        // 1) Resolve sessionName + token + displayName used at join()
-        let sessionToken = token;
-        let sessionName;
-        let displayName; // what we pass into client.join
+        // 1) Resolve token + sessionName + displayName
+        let sessionName, sessionToken = token, displayName;
 
         if (sessionToken) {
           const p = decodeJwtPayload(sessionToken);
           sessionName = p?.tpc;
-          displayName = p?.user_identity || localDisplayName(role, locationName);
+          displayName = p?.user_identity || (locationName ? `Clinic – ${locationName}` : 'Clinic');
           if (!sessionName) throw new Error('Token is missing session name (tpc).');
         } else {
           const payload = {
-            role: role ? 1 : 0,
+            role: Number(role ?? 0),
             user_id: userId ?? undefined,
             call_id: callId,
-            userName: localDisplayName(role, locationName),
+            userName: role === 1 ? `Doctor – ${locationName || ''}` : `Clinic – ${locationName || ''}`,
             location_name: locationName || undefined,
           };
           dbg('POST /join', { callId, payload });
@@ -208,8 +182,8 @@ export default function ZoomMeetingComponent({
             { headers: { 'Content-Type': 'application/json' } }
           );
 
-          // Legacy Meeting SDK fallback
           if (data?.meetingNumber) {
+            // (Rare fallback) old Meeting SDK — redirect
             const url = new URL(`https://app.zoom.us/wc/join/${data.meetingNumber}`);
             if (data.password) url.searchParams.set('pwd', data.password);
             url.searchParams.set('prefer', '1');
@@ -218,87 +192,84 @@ export default function ZoomMeetingComponent({
             return;
           }
 
-          if (!data?.token || !data?.sessionName) {
-            throw new Error('Unexpected join payload from server.');
-          }
-
+          if (!data?.token || !data?.sessionName) throw new Error('Unexpected join payload from server.');
           sessionToken = String(data.token);
           sessionName = String(data.sessionName);
           const p = decodeJwtPayload(sessionToken);
           displayName = p?.user_identity || payload.userName;
         }
 
-        // 2) Init + join
+        // 2) Init & join
         const client = ZoomVideo.createClient();
         clientRef.current = client;
 
         await client.init('en-US', 'Global', { patchJsMedia: true });
         await client.join(sessionName, sessionToken, displayName);
 
-        // label my local tile
-        if (selfLabelRef.current) {
-          selfLabelRef.current.textContent = `You — ${displayName}`;
-        }
+        // Local name tag
+        if (selfLabelRef.current) selfLabelRef.current.textContent = `You — ${displayName}`;
 
-        // 3) Start my media and preview
+        // 3) Media start + attach self
         const media = client.getMediaStream();
         mediaRef.current = media;
 
-        try { await media.startAudio(); } catch (e) { dbg('startAudio fail', e?.reason || e?.message); }
-        try { await media.startVideo({ videoElement: selfVideoRef.current }); }
-        catch (e) { dbg('startVideo fail', e?.reason || e?.message); }
+        try {
+          await media.startAudio();
+        } catch (e) {
+          dbg('startAudio blocked', e?.reason || e?.message);
+        }
+        try {
+          await media.startVideo();
+          const me = client.getCurrentUserInfo()?.userId;
+          if (selfVideoRef.current && me != null) {
+            await media.attachVideo(selfVideoRef.current, me);
+          }
+          setNeedsGesture(false);
+        } catch (e) {
+          dbg('startVideo blocked', e?.reason || e?.message);
+          setNeedsGesture(true);
+          setError('Enable camera & mic to continue');
+        }
 
-        // 4) initial remotes (always create tiles so names show)
+        // 4) Initial remotes
         const me = client.getCurrentUserInfo()?.userId;
         (client.getAllUser() || []).forEach((u) => {
-          if (u.userId !== me) {
-            ensureRemoteTile(u);
-            renderRemote(u.userId);
-          }
+          if (u.userId !== me) { ensureRemoteTile(u); renderRemote(u.userId); }
         });
 
-        // 5) events
-        const onAdded = (list) => {
-          asArray(list).forEach((u) => {
+        // 5) Events
+        client.on('user-added', (list) => {
+          const arr = Array.isArray(list) ? list : [list];
+          arr.forEach((u) => {
             if (u.userId !== client.getCurrentUserInfo()?.userId) {
               ensureRemoteTile(u);
               renderRemote(u.userId);
             }
           });
-        };
-        const onUpdated = (list) => {
-          asArray(list).forEach((u) => {
+        });
+
+        client.on('user-updated', (list) => {
+          const arr = Array.isArray(list) ? list : [list];
+          arr.forEach((u) => {
             const tile = remoteTilesRef.current.get(u.userId);
             if (tile?.label && u.displayName) tile.label.textContent = u.displayName;
           });
-        };
-        const onRemoved = (list) => {
-          asArray(list).forEach((u) => removeRemoteTile(u.userId));
-        };
-        const onPeerVideo = ({ action, userId }) => {
+        });
+
+        client.on('user-removed', (list) => {
+          const arr = Array.isArray(list) ? list : [list];
+          arr.forEach((u) => removeRemoteTile(u.userId));
+        });
+
+        client.on('peer-video-state-change', ({ action, userId }) => {
           if (action === 'Start') renderRemote(userId);
-          else stopRemoteRenderOnly(userId); // keep name tile
-        };
-
-        client.on('user-added', onAdded);
-        client.on('user-updated', onUpdated);
-        client.on('user-removed', onRemoved);
-        client.on('peer-video-state-change', onPeerVideo);
-
-        // save handlers for cleanup
-        clientRef.current._handlers = { onAdded, onUpdated, onRemoved, onPeerVideo };
+          else stopRemoteRenderOnly(userId); // keep name placeholder
+        });
 
         if (!mounted) return;
         setJoining(false);
       } catch (e) {
-        console.group('[VideoSDK][join] failed');
-        console.error('raw error:', e);
-        if (e?.response) {
-          console.error('HTTP status:', e.response.status);
-          console.error('HTTP data:', e.response.data);
-        }
-        console.groupEnd?.();
-
+        dbg('JOIN FAIL', e?.response?.data || e?.message || e);
         if (!mounted) return;
         setError(
           e?.response?.data?.error ||
@@ -313,72 +284,64 @@ export default function ZoomMeetingComponent({
 
     // Cleanup
     return () => {
-      let client = clientRef.current;
-      let media = mediaRef.current;
-
-      try {
-        // remove listeners if we attached them
-        const h = client?._handlers;
-        if (h) {
-          client.off?.('user-added', h.onAdded);
-          client.off?.('user-updated', h.onUpdated);
-          client.off?.('user-removed', h.onRemoved);
-          client.off?.('peer-video-state-change', h.onPeerVideo);
-        }
-      } catch { }
-
       try {
         remoteTilesRef.current.forEach((_, uid) => {
-          try { media?.stopRender(uid); } catch { }
+          try { mediaRef.current?.stopRender(uid); } catch { }
         });
         remoteTilesRef.current.clear();
+
+        const me = clientRef.current?.getCurrentUserInfo()?.userId;
+        if (me != null) { try { mediaRef.current?.detachVideo(me); } catch { } }
       } catch { }
 
-      try { media?.stopVideo(); } catch { }
-      try { media?.stopAudio(); } catch { }
-      try { client?.leave(); } catch { }
+      try { mediaRef.current?.stopVideo(); } catch { }
+      try { mediaRef.current?.stopAudio(); } catch { }
+      try { clientRef.current?.leave(); } catch { }
 
       clientRef.current = null;
       mediaRef.current = null;
     };
   }, [callId, locationName, role, userId, token, debug]);
 
-  // ---------- UI ----------
+  const handleEnableMedia = async () => {
+    try {
+      setError('');
+      const client = clientRef.current;
+      const media = mediaRef.current || client?.getMediaStream();
+      if (!client || !media) return;
+      try { await media.startAudio(); } catch { }
+      await media.startVideo();
+      const me = client.getCurrentUserInfo()?.userId;
+      if (selfVideoRef.current && me != null) {
+        await media.attachVideo(selfVideoRef.current, me);
+      }
+      setNeedsGesture(false);
+    } catch (e) {
+      setError(e?.reason || e?.message || 'Could not start camera/mic');
+    }
+  };
+
+  // UI
   return (
     <div style={{
-      width: '100%',
-      height: '100%',
-      display: 'grid',
-      gridTemplateRows: 'auto 1fr',
-      background: '#000',
-      color: '#fff'
+      width: '100%', height: '100%',
+      display: 'grid', gridTemplateRows: 'auto 1fr',
+      background: '#000', color: '#fff', position: 'relative'
     }}>
       {/* Top bar */}
       <div style={{
-        padding: 12,
-        display: 'flex',
-        alignItems: 'center',
-        background: 'rgba(255,255,255,.06)',
-        borderBottom: '1px solid rgba(255,255,255,.07)'
+        padding: 12, display: 'flex', alignItems: 'center', gap: 12,
+        background: 'rgba(255,255,255,.06)', borderBottom: '1px solid rgba(255,255,255,.08)'
       }}>
-        <strong style={{ letterSpacing: '.2px' }}>
-          {locationName ? `Clinic – ${locationName}` : 'Clinic'}
-        </strong>
-        <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+        <strong>{locationName ? `Clinic – ${locationName}` : 'Clinic'}</strong>
+        <div style={{ marginLeft: 'auto' }}>
           <button
             onClick={() => {
               try { mediaRef.current?.stopVideo(); } catch { }
               try { mediaRef.current?.stopAudio(); } catch { }
               try { clientRef.current?.leave(); } catch { }
             }}
-            style={{
-              padding: '6px 12px',
-              borderRadius: 8,
-              background: '#d33',
-              color: '#fff',
-              border: 0
-            }}
-          >
+            style={{ padding: '6px 12px', borderRadius: 8, background: '#d33', color: '#fff', border: 0 }}>
             Leave
           </button>
         </div>
@@ -388,39 +351,27 @@ export default function ZoomMeetingComponent({
       <div style={{
         display: 'grid',
         gridTemplateColumns: 'minmax(280px,360px) 1fr',
-        gap: 14,
-        padding: 14
+        gap: 14, padding: 14
       }}>
         {/* Local tile */}
-        <div style={{ position: 'relative' }}>
+        <div>
           <div style={{ color: '#bbb', marginBottom: 6, fontSize: 14 }}>You</div>
           <div style={{
-            position: 'relative',
-            width: '100%',
-            height: 220,
-            background: '#111',
-            borderRadius: 12,
-            overflow: 'hidden',
+            position: 'relative', width: '100%', height: 220,
+            background: '#111', borderRadius: 12, overflow: 'hidden',
             boxShadow: '0 2px 10px rgba(0,0,0,.35)'
           }}>
             <video
               ref={selfVideoRef}
-              autoPlay
-              muted
-              playsInline
-              style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
+              autoPlay muted playsInline
+              style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', background: '#111' }}
             />
             <div
               ref={selfLabelRef}
               style={{
-                position: 'absolute',
-                left: 10,
-                bottom: 8,
-                padding: '3px 8px',
-                fontSize: 12,
-                background: 'rgba(0,0,0,.55)',
-                borderRadius: 6,
-                letterSpacing: '.2px'
+                position: 'absolute', left: 10, bottom: 8,
+                padding: '3px 8px', fontSize: 12,
+                background: 'rgba(0,0,0,.55)', borderRadius: 6, letterSpacing: '.2px'
               }}
             >
               You
@@ -428,45 +379,43 @@ export default function ZoomMeetingComponent({
           </div>
         </div>
 
-        {/* Remotes */}
+        {/* Remote grid */}
         <div>
           <div style={{ color: '#bbb', marginBottom: 6, fontSize: 14 }}>Participants</div>
           <div
             ref={remoteGridRef}
-            id="remote-grid"
             style={{
-              width: '100%',
-              minHeight: 220,
               display: 'grid',
-              gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
-              gap: 12
+              gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))',
+              gap: 12,
+              minHeight: 220
             }}
           />
         </div>
       </div>
 
-      {/* Connecting overlay */}
+      {/* Overlays */}
       {joining && (
-        <div style={{
-          position: 'absolute', inset: 0, display: 'grid', placeItems: 'center',
-          background: 'rgba(0,0,0,.35)', fontSize: 16
-        }}>
+        <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,.35)' }}>
           Connecting to session…
         </div>
       )}
-
-      {/* Error bubble */}
-      {!!error && (
-        <div style={{
-          position: 'absolute', top: 12, left: 12,
-          background: 'rgba(220,0,0,.8)', padding: '8px 12px',
-          borderRadius: 6, maxWidth: 520
-        }}>
-          {String(error)}
+      {(needsGesture || !!error) && (
+        <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,.45)' }}>
+          <div style={{ display: 'grid', gap: 10, placeItems: 'center' }}>
+            {!!error && (
+              <div style={{ background: 'rgba(220,0,0,.8)', padding: '8px 12px', borderRadius: 6, maxWidth: 520 }}>
+                {String(error)}
+              </div>
+            )}
+            <button onClick={handleEnableMedia}
+              style={{ padding: '10px 14px', borderRadius: 8, border: 0, background: '#1f8fff', color: '#fff', fontWeight: 600 }}>
+              Enable camera & mic
+            </button>
+          </div>
         </div>
       )}
 
-      {/* Debug overlay (?debug=1) */}
       {debug && (
         <div style={{
           position: 'absolute', right: 8, bottom: 8, width: 360, maxHeight: 240, overflow: 'auto',
