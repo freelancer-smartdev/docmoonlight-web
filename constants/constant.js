@@ -1,5 +1,5 @@
 // export const BASE_URL = 'https://api.docmoonlight.com/';
-export const BASE_URL = process.env.BACKEND_BASE_URL;
+export const BASE_URL = 'https://employees-supervisor-customize-shows.trycloudflare.com';
 
 export const GTM_ID = 'GTM-N4C99WT';
 
