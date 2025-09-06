@@ -34,23 +34,21 @@ async function maybeAwait(v) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function mapCameraError(e) {
-  const msg = (e?.name || e?.message || '').toLowerCase();
-  if (/notallowed|permission/i.test(msg)) return 'Camera permission blocked';
-  if (/notreadable|in use|busy|trackstart/i.test(msg)) return 'Camera is in use by another app';
-  if (/notfound|overconstrained|no suitable device/i.test(msg)) return 'No camera found';
+  const s = (e?.name || e?.message || e?.reason || '').toLowerCase();
+  if (/notallowed|permission|denied/i.test(s)) return 'Camera permission blocked';
+  if (/notreadable|in use|busy|trackstart/i.test(s)) return 'Camera is in use by another app';
+  if (/notfound|overconstrained|no suitable device|device not found/i.test(s)) return 'No camera found';
   return 'Could not start camera';
 }
 
 /** Attach video – supports both old and new SDK signatures. */
 async function attachVideoCompat(stream, userId, targetEl) {
   // Prefer new API: attachVideo(userId, VideoQuality, element?)
-  const Q = (ZoomVideo && ZoomVideo.VideoQuality && ZoomVideo.VideoQuality.Video_360P) ?? 2;
+  const Q = (ZoomVideo?.VideoQuality?.Video_360P) ?? 2;
   try {
     const maybeEl = await maybeAwait(stream.attachVideo(userId, Q, targetEl));
-    // New API returns a custom element (e.g., <video-player>) or uses the passed element.
-    const el = maybeEl && maybeEl.nodeType === 1 ? maybeEl : targetEl;
+    const el = (maybeEl && maybeEl.nodeType === 1) ? maybeEl : targetEl;
     if (el && el !== targetEl && targetEl?.parentNode) {
-      // Replace placeholder <video> with SDK element.
       targetEl.parentNode.replaceChild(el, targetEl);
     }
     return el || targetEl;
@@ -71,8 +69,8 @@ async function attachVideoCompat(stream, userId, targetEl) {
 /** Detach video – supports both old and new SDK signatures. */
 async function detachVideoCompat(stream, userId, el) {
   try {
-    // New API prefers (userId, element?)
-    await maybeAwait(stream.detachVideo?.(userId, el));
+    // New API usually accepts (userId [, element]) — userId alone is sufficient.
+    await maybeAwait(stream.detachVideo?.(userId));
   } catch {
     try {
       // Old API variants
@@ -198,14 +196,18 @@ export default function ZoomMeetingComponent({
       if (!client || !media) return;
 
       const user = (client.getAllUser() || []).find((u) => u.userId === uid) || { userId: uid };
-      const { video } = ensureRemoteTile(user);
+      const tile = ensureRemoteTile(user);
+      const target = tile.video;
 
       if (!user.bVideoOn) {
         if (attempt < 3) { await sleep(120); return attachRemote(uid, attempt + 1); }
         return;
       }
 
-      await attachVideoCompat(media, uid, video);
+      const el = await attachVideoCompat(media, uid, target);
+      if (el && el !== target) {
+        tile.video = el; // keep the real element for future detaches
+      }
       dbg('remote.attach ok', { uid, attempt });
     } catch (e) {
       const msg = e?.reason || e?.message || String(e);
@@ -227,6 +229,61 @@ export default function ZoomMeetingComponent({
     const tile = remoteTilesRef.current.get(uid);
     if (tile?.wrapper) tile.wrapper.remove();
     remoteTilesRef.current.delete(uid);
+  };
+
+  // ---------- Camera start helper (explicit deviceId) ----------
+  const startCamInternal = async (preferredId) => {
+    setError('');
+    const client = clientRef.current;
+    const media  = mediaRef.current;
+    if (!client || !media) return false;
+
+    // Ensure camera list & selected device
+    let selected = preferredId || camId;
+    try {
+      const list = await maybeAwait(media.getCameraList?.());
+      if (Array.isArray(list) && list.length) {
+        setCams(list);
+        if (!selected) {
+          selected = list[0].deviceId;
+          setCamId(selected);
+        }
+      }
+    } catch {}
+
+    // Pre-warm browser permission for the SAME device
+    try {
+      const constraints = selected ? { video: { deviceId: { exact: selected } } } : { video: true };
+      const tmp = await navigator.mediaDevices.getUserMedia(constraints);
+      tmp.getTracks().forEach((t) => t.stop());
+    } catch (e) {
+      setError(mapCameraError(e));
+      return false;
+    }
+
+    // Start video with explicit device (when supported)
+    try {
+      if (selected && media.startVideo?.length) {
+        await maybeAwait(media.startVideo({ deviceId: selected }));
+      } else {
+        await maybeAwait(media.startVideo());
+        if (selected) { try { await maybeAwait(media.switchCamera?.(selected)); } catch {} }
+      }
+
+      await sleep(80);
+      const me = client.getCurrentUserInfo()?.userId;
+      if (selfVideoRef.current && me != null) {
+        const el = await attachVideoCompat(media, me, selfVideoRef.current);
+        if (el && el !== selfVideoRef.current) selfVideoRef.current = el;
+      }
+      setCamOn(true);
+      setNeedsGesture(false);
+      return true;
+    } catch (e) {
+      dbg('startVideo fail', e?.reason || e?.message || String(e));
+      setError(mapCameraError(e));
+      return false;
+    }
   };
 
   // ---------- Join & events ----------
@@ -293,7 +350,7 @@ export default function ZoomMeetingComponent({
 
         if (selfLabelRef.current) selfLabelRef.current.textContent = `You — ${myDisplayName}`;
 
-        // 3) Start media + self preview
+        // 3) Media + devices
         const media = client.getMediaStream();
         mediaRef.current = media;
 
@@ -305,40 +362,18 @@ export default function ZoomMeetingComponent({
           }
         } catch {}
 
-        try {
-          await maybeAwait(media.startAudio());
-          setMicOn(true);
-        } catch (e) {
-          dbg('startAudio fail', e?.reason || e?.message);
-          setMicOn(false);
-        }
+        // Defer AUDIO to user gesture (mobile/safari friendly)
+        setMicOn(false);
 
-        const me = client.getCurrentUserInfo()?.userId;
-        try {
-          // Pre-warm user permission errors clearly
-          try {
-            const tmp = await navigator.mediaDevices.getUserMedia({ video: true });
-            tmp.getTracks().forEach((t) => t.stop());
-          } catch (permErr) {
-            throw permErr;
-          }
-
-          await maybeAwait(media.startVideo());              // publish camera
-          if (camId) { try { await maybeAwait(media.switchCamera?.(camId)); } catch {} }
-          await sleep(80);                                   // let track warm up
-          if (selfVideoRef.current && me != null) {
-            await attachVideoCompat(media, me, selfVideoRef.current); // self preview
-          }
-          setCamOn(true);
-          setNeedsGesture(false);
-        } catch (e) {
-          dbg('startVideo fail', e?.reason || e?.message);
-          setCamOn(false);
+        // Desktop convenience: attempt to start cam now; mobile waits for gesture
+        if (!isMobileUA) {
+          await startCamInternal();
+        } else {
           setNeedsGesture(true);
-          setError(mapCameraError(e));
         }
 
         // 4) Current remotes
+        const me = client.getCurrentUserInfo()?.userId;
         (client.getAllUser() || []).forEach((u) => {
           if (u.userId !== me) {
             ensureRemoteTile(u);
@@ -390,10 +425,10 @@ export default function ZoomMeetingComponent({
         if (!mounted) return;
         setError(
           e?.response?.data?.error ||
-            e?.response?.data?.message ||
-            e?.reason ||
-            e?.message ||
-            'Failed to join session'
+          e?.response?.data?.message ||
+          e?.reason ||
+          e?.message ||
+          'Failed to join session'
         );
         setJoining(false);
       }
@@ -433,7 +468,27 @@ export default function ZoomMeetingComponent({
       clientRef.current = null;
       mediaRef.current  = null;
     };
-  }, [callId, locationName, role, userId, token, debug, camId]);
+  // 🔴 Do NOT depend on camId or debug here to avoid unintended re-joins.
+  }, [callId, locationName, role, userId, token]); 
+
+  // Switch camera without re-joining
+  useEffect(() => {
+    (async () => {
+      const media = mediaRef.current;
+      if (!media || !camOn || !camId) return;
+      try {
+        if (media.switchCamera) {
+          await maybeAwait(media.switchCamera(camId));
+        } else {
+          // Fallback: restart video on the chosen device
+          await maybeAwait(media.stopVideo());
+          await startCamInternal(camId);
+        }
+      } catch (e) {
+        dbg('switchCamera fail', e?.message || String(e));
+      }
+    })();
+  }, [camId, camOn]);
 
   // ---------- Controls ----------
   const toggleMic = async () => {
@@ -447,46 +502,18 @@ export default function ZoomMeetingComponent({
     }
   };
 
-  const startCam = async () => {
-    setError('');
-    const client = clientRef.current;
-    const media  = mediaRef.current;
-    if (!client || !media) return;
-
-    try {
-      const tmp = await navigator.mediaDevices.getUserMedia({ video: true });
-      tmp.getTracks().forEach((t) => t.stop());
-    } catch (e) {
-      setError(mapCameraError(e));
-      return;
-    }
-
-    try {
-      await maybeAwait(media.startVideo());
-      if (camId) { try { await maybeAwait(media.switchCamera?.(camId)); } catch {} }
-      await sleep(80);
-      const me = client.getCurrentUserInfo()?.userId;
-      if (selfVideoRef.current && me != null) {
-        await attachVideoCompat(media, me, selfVideoRef.current);
-      }
-      setCamOn(true);
-      setNeedsGesture(false);
-    } catch (e) {
-      setError(mapCameraError(e));
-    }
-  };
-
-  const stopCam = async () => {
+  const startCam = async () => { await startCamInternal(); };
+  const stopCam  = async () => {
     try { await maybeAwait(mediaRef.current?.stopVideo()); } catch {}
     setCamOn(false);
   };
-
   const toggleCam = async () => (camOn ? stopCam() : startCam());
 
   const handleEnable = async () => {
     setError('');
+    // Start camera first (more reliable for autoplay policies), then mic
+    await startCamInternal();
     await toggleMic();
-    await startCam();
   };
 
   // ---------- UI ----------
