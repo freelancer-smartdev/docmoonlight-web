@@ -18,7 +18,7 @@ function decodeJwtPayload(token) {
       atob(b64)
         .split('')
         .map((c) => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
-        .join('')
+        .join(''),
     );
     return JSON.parse(json);
   } catch {
@@ -26,13 +26,18 @@ function decodeJwtPayload(token) {
   }
 }
 
-export default function ZoomMeetingComponent({
-  callId,
-  locationName,
-  role = 0,
-  userId,
-  token,
-}) {
+// Helper: await only if it's a thenable (SDK varies by version)
+async function maybeAwait(v) {
+  if (v && typeof v.then === 'function') {
+    return await v;
+  }
+  return v;
+}
+
+// Tiny delay helper for race-y state changes
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+export default function ZoomMeetingComponent({ callId, locationName, role = 0, userId, token }) {
   // ---------- Refs ----------
   const clientRef = useRef(null);
   const mediaRef = useRef(null);
@@ -55,7 +60,7 @@ export default function ZoomMeetingComponent({
     typeof navigator !== 'undefined' && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
   const [needsGesture, setNeedsGesture] = useState(isMobileUA);
 
-  // optional on-screen debug (?debug=1)
+  // Debug overlay (?debug=1)
   const [debug, setDebug] = useState(false);
   const [debugLines, setDebugLines] = useState([]);
   useEffect(() => {
@@ -66,13 +71,13 @@ export default function ZoomMeetingComponent({
   const dbg = (msg, data) => {
     if (debug) {
       const line = `[VideoSDK] ${msg} ${data ? JSON.stringify(data) : ''}`;
-      setDebugLines((prev) => prev.concat(line).slice(-160));
+      setDebugLines((p) => p.concat(line).slice(-200));
     }
     if (data !== undefined) console.log('[VideoSDK]', msg, data);
     else console.log('[VideoSDK]', msg);
   };
 
-  // ---------- UI helpers for remote tiles ----------
+  // ---------- Remote tile helpers ----------
   const ensureRemoteTile = (user) => {
     const uid = user.userId;
     let tile = remoteTilesRef.current.get(uid);
@@ -92,11 +97,10 @@ export default function ZoomMeetingComponent({
       display: 'grid',
     });
 
-    // IMPORTANT: use <video> (not canvas) for Android/iOS/Chrome without SAB
     const video = document.createElement('video');
     video.autoplay = true;
     video.playsInline = true;
-    video.muted = true; // no audio from this element; Zoom mixes audio separately
+    video.muted = true; // audio is handled by the SDK separately
     Object.assign(video.style, {
       width: '100%',
       height: '100%',
@@ -129,7 +133,8 @@ export default function ZoomMeetingComponent({
     return tile;
   };
 
-  const attachRemote = (uid) => {
+  // Attach a remote user to a <video>, with a short retry if the track isn’t ready yet.
+  const attachRemote = async (uid, attempt = 0) => {
     try {
       const client = clientRef.current;
       const media = mediaRef.current;
@@ -138,22 +143,37 @@ export default function ZoomMeetingComponent({
       const user = (client.getAllUser() || []).find((u) => u.userId === uid) || { userId: uid };
       const { video } = ensureRemoteTile(user);
 
-      // Use attachVideo for remotes
-      media.attachVideo(video, uid);
-      dbg('remote.attach ok', { uid });
+      // If the peer’s video isn’t on yet, delay and retry once or twice.
+      if (!user.bVideoOn) {
+        if (attempt < 3) {
+          await sleep(120);
+          return attachRemote(uid, attempt + 1);
+        }
+        return; // keep placeholder tile
+      }
+
+      const res = media.attachVideo(video, uid);
+      await maybeAwait(res);
+      dbg('remote.attach ok', { uid, attempt });
     } catch (e) {
-      dbg('remote.attach fail', { uid, err: e?.reason || e?.message || String(e) });
+      const msg = e?.reason || e?.message || String(e);
+      dbg('remote.attach fail', { uid, attempt, err: msg });
+      if (/not send video/i.test(msg) && attempt < 3) {
+        await sleep(160);
+        return attachRemote(uid, attempt + 1);
+      }
     }
   };
 
-  const detachRemote = (uid) => {
+  const detachRemote = async (uid) => {
     try {
-      mediaRef.current?.detachVideo(uid);
+      const res = mediaRef.current?.detachVideo(uid);
+      await maybeAwait(res);
     } catch {}
   };
 
-  const removeRemoteTile = (uid) => {
-    detachRemote(uid);
+  const removeRemoteTile = async (uid) => {
+    await detachRemote(uid);
     const tile = remoteTilesRef.current.get(uid);
     if (tile?.wrapper) tile.wrapper.remove();
     remoteTilesRef.current.delete(uid);
@@ -192,7 +212,7 @@ export default function ZoomMeetingComponent({
           const { data } = await axios.post(
             `${API_BASE}/qr/calls/${encodeURIComponent(String(callId))}/join`,
             payload,
-            { headers: { 'Content-Type': 'application/json' } }
+            { headers: { 'Content-Type': 'application/json' } },
           );
 
           if (data?.meetingNumber) {
@@ -223,12 +243,13 @@ export default function ZoomMeetingComponent({
 
         if (selfLabelRef.current) selfLabelRef.current.textContent = `You — ${myDisplayName}`;
 
-        // 3) Start media and attach local preview to <video>
+        // 3) Start media + local preview
         const media = client.getMediaStream();
         mediaRef.current = media;
 
         try {
-          await media.startAudio();
+          const r = media.startAudio();
+          await maybeAwait(r);
           setMicOn(true);
         } catch (e) {
           dbg('startAudio fail', e?.reason || e?.message);
@@ -237,9 +258,12 @@ export default function ZoomMeetingComponent({
 
         const me = client.getCurrentUserInfo()?.userId;
         try {
-          await media.startVideo(); // publish camera
+          // Start sending camera
+          await maybeAwait(media.startVideo());
+          // Let the track warm up a frame or two before attaching
+          await sleep(80);
           if (selfVideoRef.current && me != null) {
-            media.attachVideo(selfVideoRef.current, me); // local preview using <video>
+            await maybeAwait(media.attachVideo(selfVideoRef.current, me));
           }
           setCamOn(true);
           setNeedsGesture(false);
@@ -248,13 +272,13 @@ export default function ZoomMeetingComponent({
           setCamOn(false);
           setNeedsGesture(true);
           setError(
-            /NotAllowed|Permission/.test(e?.name || e?.message || '')
+            /NotAllowed|Permission/i.test(e?.name || e?.message || '')
               ? 'Camera permission blocked or in use by another app'
-              : 'Could not start camera'
+              : 'Could not start camera',
           );
         }
 
-        // 4) Render current remotes (create tiles, attach if sending)
+        // 4) Create remote tiles and attach those already sending video
         (client.getAllUser() || []).forEach((u) => {
           if (u.userId !== me) {
             ensureRemoteTile(u);
@@ -285,16 +309,14 @@ export default function ZoomMeetingComponent({
 
         const onPeerVideo = ({ action, userId }) => {
           dbg('peer-video-state-change', { action, userId });
-          if (action === 'Start') attachRemote(userId);
-          else detachRemote(userId); // keep tile; just blank out
+          if (action === 'Start') attachRemote(userId, 0);
+          else detachRemote(userId); // keep tile, just blank it
         };
 
         client.on('user-added', onAdded);
         client.on('user-updated', onUpdated);
         client.on('user-removed', onRemoved);
         client.on('peer-video-state-change', onPeerVideo);
-
-        // save handlers for proper cleanup
         clientRef.current._handlers = { onAdded, onUpdated, onRemoved, onPeerVideo };
 
         if (!mounted) return;
@@ -314,7 +336,7 @@ export default function ZoomMeetingComponent({
             e?.response?.data?.message ||
             e?.reason ||
             e?.message ||
-            'Failed to join session'
+            'Failed to join session',
         );
         setJoining(false);
       }
@@ -336,19 +358,19 @@ export default function ZoomMeetingComponent({
       } catch {}
 
       try {
-        remoteTilesRef.current.forEach((_, uid) => {
-          try { media?.detachVideo(uid); } catch {}
+        remoteTilesRef.current.forEach(async (_, uid) => {
+          try { await maybeAwait(media?.detachVideo(uid)); } catch {}
         });
         remoteTilesRef.current.clear();
       } catch {}
 
       try {
         const me = client?.getCurrentUserInfo()?.userId;
-        if (me != null) media?.detachVideo(me);
+        if (me != null) maybeAwait(media?.detachVideo(me));
       } catch {}
 
-      try { media?.stopVideo(); } catch {}
-      try { media?.stopAudio(); } catch {}
+      try { maybeAwait(media?.stopVideo()); } catch {}
+      try { maybeAwait(media?.stopAudio()); } catch {}
       try { client?.leave(); } catch {}
 
       clientRef.current = null;
@@ -361,8 +383,8 @@ export default function ZoomMeetingComponent({
     const media = mediaRef.current;
     if (!media) return;
     try {
-      if (micOn) { await media.stopAudio(); setMicOn(false); }
-      else { await media.startAudio(); setMicOn(true); }
+      if (micOn) { await maybeAwait(media.stopAudio()); setMicOn(false); }
+      else { await maybeAwait(media.startAudio()); setMicOn(true); }
     } catch (e) {
       setError('Microphone error: ' + (e?.reason || e?.message || 'unknown'));
     }
@@ -374,22 +396,23 @@ export default function ZoomMeetingComponent({
     if (!client || !media) return;
     try {
       if (camOn) {
-        await media.stopVideo();
+        await maybeAwait(media.stopVideo());
         setCamOn(false);
       } else {
-        await media.startVideo(); // publish
+        await maybeAwait(media.startVideo());
+        await sleep(80);
         const me = client.getCurrentUserInfo()?.userId;
         if (selfVideoRef.current && me != null) {
-          media.attachVideo(selfVideoRef.current, me);
+          await maybeAwait(media.attachVideo(selfVideoRef.current, me));
         }
         setCamOn(true);
         setNeedsGesture(false);
       }
     } catch (e) {
       setError(
-        /NotAllowed|Permission/.test(e?.name || e?.message || '')
+        /NotAllowed|Permission/i.test(e?.name || e?.message || '')
           ? 'Camera permission blocked or in use by another app'
-          : 'Could not start camera'
+          : 'Could not start camera',
       );
     }
   };
@@ -437,8 +460,8 @@ export default function ZoomMeetingComponent({
           </button>
           <button
             onClick={() => {
-              try { mediaRef.current?.stopVideo(); } catch {}
-              try { mediaRef.current?.stopAudio(); } catch {}
+              try { maybeAwait(mediaRef.current?.stopVideo()); } catch {}
+              try { maybeAwait(mediaRef.current?.stopAudio()); } catch {}
               try { clientRef.current?.leave(); } catch {}
             }}
             style={{ padding: '6px 12px', borderRadius: 8, background: '#d33', color: '#fff', border: 0 }}
