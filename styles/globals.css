@@ -1,0 +1,228 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  @font-face {
+    font-family: 'noto sans';
+    src: url('/NotoSans-SemiBold.ttf');
+  }
+  @font-face {
+    font-family: 'noto sans bold';
+    src: url('/NotoSans-Black.ttf');
+  }
+}
+body {
+  font-family: 'noto sans';
+}
+
+h2 {
+  font-family: 'noto sans bold';
+}
+.unsplash {
+  background-image: url('/images/bg1.svg');
+  padding-top: 80px;
+  padding-bottom: 80px;
+  background-repeat: no-repeat;
+  color: #FFFFFF;
+}
+
+.unsplash-container {
+  width: 95%;
+}
+
+ul.mission {
+  list-style-type: square;
+  opacity: 80%;
+  font-size: 14px;
+  margin-left: 11px;
+  padding-top:10px ;
+}
+
+.btn-color {
+  color: #131963;
+}
+
+.service {
+  background-image: url('/images/service_bg.svg');
+}
+
+.demo-bg {
+  background-image: url('/images/demo_bg.svg');
+  color: #FFFFFF;
+  background-size: cover;
+  padding-top: 70px;
+}
+
+.ellipse {
+  position: relative;
+}
+.inner_img {
+  position: absolute;
+  z-index: 1;
+  top: 46px;
+  left: 160px;
+  width: 58px;
+  height: 58px;
+}
+.mobiles {
+  position: relative;
+  width: 300px;
+  height: 500px;
+}
+.top {
+  position: absolute;
+  z-index: 2;
+  top: 0;
+  left: 0;
+  width: 212px;
+  height: 414px;
+}
+.bottom {
+  position: absolute;
+  top: 40px;
+  left: 139px;
+  z-index: 1;
+  width: 204px;
+  height: 373px;
+}
+
+@media screen and (max-width: 480px) {
+  .inner_img {
+    position: absolute;
+    top: 45px;
+    left: 130px;
+  }
+}
+.video-img {
+  margin: 0 auto;
+  width: 1600px;
+  height: 517px;
+}
+.About {
+  background-image: url('/images/about_us.svg');
+  width: 100%;
+  background-size: cover;
+}
+
+.about-card-text {
+  width: 280px;
+}
+.map {
+  width: 568px;
+  height: 446px;
+}
+.footer {
+  background-image: url("/images/footer.svg");
+  min-height: 400px;
+  background-repeat: no-repeat;
+  background-size: cover;
+  width: 100%;
+}
+.footer_container {
+  max-width: 1120px;
+  margin: 0 auto;
+  padding-top: 50px;
+}
+
+.footer-links {
+  color: #899BA9;
+  font-size: 23px;
+}
+
+.video-style {
+  height: auto;
+    width: auto;
+top: 45%;
+left: 49%;
+}
+
+
+@media screen and (max-width: 768px) {
+.video-style {
+height: auto;
+  width: auto;
+  top: 44%;
+  left: 49%;
+  }
+}
+
+@media screen and (min-width: 768px) {
+  .video-style {
+    top: 48%;
+  }
+}
+@media screen and (min-width: 1046px) {
+  .video-style {
+    top: 46%;
+  }
+}
+
+@media screen and (min-width: 1475px) {
+  .video-style {
+  height: auto;
+    width: auto;
+    top: 44%;
+    left: 49%;
+  }
+}
+
+
+/* Base input and dropdown styling */
+.input-base,
+.select-dropdown {
+  appearance: none;
+  width: 100%;
+  /* Full width */
+  padding: 12px 20px;
+  /* Appropriate padding */
+  font-size: 16px;
+  /* Legible font size */
+  line-height: 1.5;
+  color: #495057;
+  /* Text color */
+  background-color: #fff;
+  /* Background color */
+  border: 1px solid #ced4da;
+  /* Uniform border color */
+  border-radius: 4px;
+  /* Rounded corners */
+  transition: border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out;
+  /* Smooth transition for focus */
+}
+
+/* Focus states for inputs and dropdowns */
+.input-base:focus,
+.select-dropdown:focus {
+  border-color: #86b7fe;
+  /* Highlight color on focus */
+  outline: none;
+  /* Remove default outline */
+  box-shadow: 0 0 0 0.2rem rgba(13, 110, 253, 0.25);
+  /* Subtle focus shadow */
+}
+
+/* Customizing the dropdown to include a downward arrow */
+.select-dropdown {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='rgba(0, 0, 0, 0.6)'%3E%3Cpath fill-rule='evenodd' d='M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z' clip-rule='evenodd'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.75rem center;
+  /* Position the arrow icon */
+  background-size: 16px 12px;
+  /* Size of the arrow icon */
+}
+
+
+.map-container {
+  margin: 20px auto;
+}
+
+@media (max-width: 768px) {
+  .map-container {
+    margin: 0;
+  }
+}
+
+::-webkit-scrollbar {
+  display: none;
+}
