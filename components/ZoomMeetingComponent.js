@@ -31,24 +31,28 @@ export default function ZoomMeetingComponent({
   userId,
   token,
 }) {
-  // ---- Refs
-  const selfVideoRef = useRef(null);
+  // ---- refs
+  const selfCanvasRef = useRef(null);
   const selfLabelRef = useRef(null);
   const clientRef = useRef(null);
   const mediaRef = useRef(null);
   const remoteGridRef = useRef(null);
   const remoteTilesRef = useRef(new Map()); // userId -> {wrapper, canvas, label}
 
-  // ---- State
+  // ---- state
   const [joining, setJoining] = useState(true);
   const [error, setError] = useState('');
   const [camOn, setCamOn] = useState(false);
   const [micOn, setMicOn] = useState(false);
+  const [cams, setCams] = useState([]);
+  const [activeCamIdx, setActiveCamIdx] = useState(0);
+
+  // gesture gate for mobile
   const [needsGesture, setNeedsGesture] = useState(
     typeof navigator !== 'undefined' && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
   );
 
-  // Debug overlay (?debug=1)
+  // debug overlay (?debug=1)
   const [debug, setDebug] = useState(false);
   const [debugLines, setDebugLines] = useState([]);
   useEffect(() => {
@@ -59,30 +63,32 @@ export default function ZoomMeetingComponent({
   const dbg = (msg, data) => {
     if (debug) {
       const line = `[VideoSDK] ${msg} ${data ? JSON.stringify(data) : ''}`;
-      setDebugLines((prev) => prev.concat(line).slice(-160));
+      setDebugLines((p) => p.concat(line).slice(-160));
     }
     if (data !== undefined) console.log('[VideoSDK]', msg, data);
     else console.log('[VideoSDK]', msg);
   };
 
   // ---- UI helpers
-  const button = (onClick, label, color = '#2b8bff') => (
+  const Btn = ({ onClick, label, color = '#2b8bff', disabled }) => (
     <button
       onClick={onClick}
+      disabled={disabled}
       style={{
         padding: '6px 12px',
         borderRadius: 8,
         border: 0,
-        background: color,
+        background: disabled ? '#555' : color,
         color: '#fff',
         fontWeight: 600,
+        cursor: disabled ? 'not-allowed' : 'pointer',
       }}
     >
       {label}
     </button>
   );
 
-  // ---- Remote tiles
+  // ---- remote tiles
   const ensureRemoteTile = (user) => {
     const uid = user.userId;
     let tile = remoteTilesRef.current.get(uid);
@@ -161,7 +167,7 @@ export default function ZoomMeetingComponent({
   };
 
   const stopRemoteRenderOnly = (uid) => {
-    try { mediaRef.current?.stopRender(uid); } catch { }
+    try { mediaRef.current?.stopRender(uid); } catch {}
     const tile = remoteTilesRef.current.get(uid);
     if (tile?.canvas) {
       const ctx = tile.canvas.getContext('2d');
@@ -179,47 +185,89 @@ export default function ZoomMeetingComponent({
     }
   };
 
-  // ---- Local media control
-  const attachSelf = async (retry = 0) => {
+  // ---- self render (canvas)
+  const renderSelf = async () => {
     const client = clientRef.current;
     const media = mediaRef.current;
-    if (!client || !media) return false;
+    const canvas = selfCanvasRef.current;
+    if (!client || !media || !canvas) return;
+
     const me = client.getCurrentUserInfo()?.userId;
-    if (!selfVideoRef.current || me == null) return false;
+    if (me == null) return;
+
+    // use actual CSS size for better sharpness
+    const rect = canvas.getBoundingClientRect();
+    const w = Math.max(160, Math.floor(rect.width || 320));
+    const h = Math.max(90, Math.floor(rect.height || 180));
 
     try {
-      await media.attachVideo(selfVideoRef.current, me);
-      dbg('attach self ok');
-      return true;
+      await media.stopRender(me); // in case we are re-rendering after resize/switch
+    } catch {}
+
+    try {
+      await media.renderVideo(canvas, me, w, h, 0, 0, 2);
+      dbg('self.render ok', { w, h });
     } catch (e) {
-      dbg('attach self fail', e?.reason || e?.message);
-      if (retry < 3) {
-        setTimeout(() => attachSelf(retry + 1), 400 * (retry + 1));
+      dbg('self.render fail', e?.reason || e?.message);
+      // fallback: try attach pipeline (rarely needed now)
+      try {
+        await media.attachVideo(canvas, me);
+        dbg('self.attach fallback ok');
+      } catch (e2) {
+        dbg('self.attach fallback fail', e2?.reason || e2?.message);
       }
-      return false;
     }
+  };
+
+  const stopSelfRender = async () => {
+    try {
+      const me = clientRef.current?.getCurrentUserInfo()?.userId;
+      if (me != null) await mediaRef.current?.stopRender(me);
+    } catch {}
+  };
+
+  // ---- audio/video control
+  const startMyAudio = async () => {
+    try {
+      await mediaRef.current?.startAudio();
+      setMicOn(true);
+      setNeedsGesture(false);
+    } catch (e) {
+      const name = e?.name || e?.errorCode;
+      if (name === 'NotAllowedError') setError('Microphone blocked. Click the address-bar mic icon to allow.');
+      else if (name === 'NotReadableError') setError('Microphone is used by another app. Close it and retry.');
+      else setError(e?.reason || e?.message || 'Could not start mic');
+      throw e;
+    }
+  };
+
+  const stopMyAudio = async () => {
+    try { await mediaRef.current?.stopAudio(); } catch {}
+    setMicOn(false);
   };
 
   const startMyVideo = async () => {
     const media = mediaRef.current;
     try {
-      // choose a camera if available
-      const cams = await media.getCameraList?.().catch(() => []);
-      if (cams?.length) {
-        try { await media.switchCamera(cams[0].deviceId); } catch { }
+      // pick a camera
+      const list = await media.getCameraList?.().catch(() => []);
+      if (Array.isArray(list) && list.length) {
+        setCams(list);
+        setActiveCamIdx((idx) => Math.min(idx, list.length - 1));
+        try { await media.switchCamera(list[activeCamIdx]?.deviceId || list[0].deviceId); } catch {}
       }
 
       try {
-        await media.startVideo(); // publish local video
+        await media.startVideo(); // publish local camera
       } catch (e) {
         const name = e?.name || e?.errorCode;
         if (name === 'NotAllowedError') setError('Camera blocked. Click the address-bar camera icon to allow.');
-        else if (name === 'NotReadableError') setError('Camera is used by another app. Close other apps using the camera and retry.');
+        else if (name === 'NotReadableError') setError('Camera is used by another app. Close it and retry.');
         else setError(e?.reason || e?.message || 'Could not start camera');
         throw e;
       }
 
-      await attachSelf();
+      await renderSelf();
       setCamOn(true);
       setNeedsGesture(false);
     } catch (e) {
@@ -229,33 +277,28 @@ export default function ZoomMeetingComponent({
   };
 
   const stopMyVideo = async () => {
-    try { await mediaRef.current?.stopVideo(); } catch { }
+    await stopSelfRender();
+    try { await mediaRef.current?.stopVideo(); } catch {}
     setCamOn(false);
   };
 
-  const startMyAudio = async () => {
+  const toggleMic = async () => (micOn ? stopMyAudio() : startMyAudio());
+  const toggleCam = async () => (camOn ? stopMyVideo() : startMyVideo());
+
+  const switchCam = async () => {
+    const media = mediaRef.current;
+    if (!cams.length) return;
+    const next = (activeCamIdx + 1) % cams.length;
     try {
-      await mediaRef.current?.startAudio();
-      setMicOn(true);
-      setNeedsGesture(false);
+      await media.switchCamera(cams[next].deviceId);
+      setActiveCamIdx(next);
+      if (camOn) await renderSelf(); // refresh render on this canvas with new device
     } catch (e) {
-      const name = e?.name || e?.errorCode;
-      if (name === 'NotAllowedError') setError('Microphone blocked. Click the address-bar mic icon to allow.');
-      else if (name === 'NotReadableError') setError('Microphone is used by another app. Close other apps using the mic and retry.');
-      else setError(e?.reason || e?.message || 'Could not start mic');
-      throw e;
+      dbg('switchCamera fail', e?.reason || e?.message);
     }
   };
 
-  const stopMyAudio = async () => {
-    try { await mediaRef.current?.stopAudio(); } catch { }
-    setMicOn(false);
-  };
-
-  const toggleCam = async () => (camOn ? stopMyVideo() : startMyVideo());
-  const toggleMic = async () => (micOn ? stopMyAudio() : startMyAudio());
-
-  // ---- Join & events
+  // ---- join & events
   useEffect(() => {
     if (!callId && !token) return;
     let mounted = true;
@@ -265,7 +308,7 @@ export default function ZoomMeetingComponent({
         setError('');
         setJoining(true);
 
-        // 1) Resolve sessionName + token + displayName
+        // token/session
         let sessionToken = token;
         let sessionName;
         let displayName;
@@ -310,25 +353,23 @@ export default function ZoomMeetingComponent({
           displayName = p?.user_identity || payload.userName;
         }
 
-        // 2) Init & join
+        // init/join
         const client = ZoomVideo.createClient();
         clientRef.current = client;
 
         await client.init('en-US', 'Global', { patchJsMedia: true });
         await client.join(sessionName, sessionToken, displayName);
 
-        if (selfLabelRef.current) {
-          selfLabelRef.current.textContent = `You — ${displayName}`;
-        }
+        if (selfLabelRef.current) selfLabelRef.current.textContent = `You — ${displayName}`;
 
         const media = client.getMediaStream();
         mediaRef.current = media;
 
-        // 3) Try to start media (may fail due to permissions/OS locks)
-        try { await startMyAudio(); } catch { /* handled above */ }
-        try { await startMyVideo(); } catch { /* handled above */ }
+        // start local media (may be blocked → needsGesture)
+        try { await startMyAudio(); } catch {}
+        try { await startMyVideo(); } catch {}
 
-        // 4) Existing remotes
+        // render existing remotes
         const me = client.getCurrentUserInfo()?.userId;
         (client.getAllUser() || []).forEach((u) => {
           if (u.userId !== me) {
@@ -337,7 +378,7 @@ export default function ZoomMeetingComponent({
           }
         });
 
-        // 5) Events
+        // events
         const onAdded = (list) => {
           asArray(list).forEach((u) => {
             if (u.userId !== client.getCurrentUserInfo()?.userId) {
@@ -389,7 +430,7 @@ export default function ZoomMeetingComponent({
       }
     })();
 
-    // Cleanup
+    // cleanup
     return () => {
       const client = clientRef.current;
       const media = mediaRef.current;
@@ -402,31 +443,25 @@ export default function ZoomMeetingComponent({
           client.off?.('user-removed', h.onRemoved);
           client.off?.('peer-video-state-change', h.onPeerVideo);
         }
-      } catch { }
+      } catch {}
 
-      // detach self
-      try {
-        const me = client?.getCurrentUserInfo?.()?.userId;
-        if (me != null) media?.detachVideo?.(me);
-      } catch { }
+      stopSelfRender();
 
       try {
-        remoteTilesRef.current.forEach((_, uid) => {
-          try { media?.stopRender(uid); } catch { }
-        });
+        remoteTilesRef.current.forEach((_, uid) => { try { media?.stopRender(uid); } catch {} });
         remoteTilesRef.current.clear();
-      } catch { }
+      } catch {}
 
-      try { media?.stopVideo(); } catch { }
-      try { media?.stopAudio(); } catch { }
-      try { client?.leave(); } catch { }
+      try { media?.stopVideo(); } catch {}
+      try { media?.stopAudio(); } catch {}
+      try { client?.leave(); } catch {}
 
       clientRef.current = null;
       mediaRef.current = null;
     };
-  }, [callId, locationName, role, userId, token, debug]);
+  }, [callId, locationName, role, userId, token, debug, activeCamIdx]);
 
-  // ---- Gesture CTA
+  // overlay action
   const handleEnable = async () => {
     setError('');
     try { await startMyAudio(); } catch {}
@@ -443,7 +478,7 @@ export default function ZoomMeetingComponent({
       background: '#000',
       color: '#fff'
     }}>
-      {/* Top bar */}
+      {/* top bar */}
       <div style={{
         padding: 12,
         display: 'flex',
@@ -455,26 +490,30 @@ export default function ZoomMeetingComponent({
         <strong style={{ letterSpacing: '.2px' }}>
           {locationName ? `Clinic – ${locationName}` : 'Clinic'}
         </strong>
-
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
-          {button(toggleMic, micOn ? 'Mic On' : 'Mic Off', micOn ? '#2faa60' : '#6b7280')}
-          {button(toggleCam, camOn ? 'Cam On' : 'Cam Off', camOn ? '#2b8bff' : '#6b7280')}
-          {button(() => {
-            try { mediaRef.current?.stopVideo(); } catch {}
-            try { mediaRef.current?.stopAudio(); } catch {}
-            try { clientRef.current?.leave(); } catch {}
-          }, 'Leave', '#d33')}
+          <Btn onClick={toggleMic} label={micOn ? 'Mic On' : 'Mic Off'} color={micOn ? '#2faa60' : '#6b7280'} />
+          <Btn onClick={toggleCam} label={camOn ? 'Cam On' : 'Cam Off'} color={camOn ? '#2b8bff' : '#6b7280'} />
+          <Btn onClick={switchCam} label="Swap Cam" color="#8b5cf6" disabled={cams.length < 2} />
+          <Btn
+            onClick={() => {
+              try { mediaRef.current?.stopVideo(); } catch {}
+              try { mediaRef.current?.stopAudio(); } catch {}
+              try { clientRef.current?.leave(); } catch {}
+            }}
+            label="Leave"
+            color="#d33"
+          />
         </div>
       </div>
 
-      {/* Stage */}
+      {/* stage */}
       <div style={{
         display: 'grid',
         gridTemplateColumns: 'minmax(280px,360px) 1fr',
         gap: 14,
         padding: 14
       }}>
-        {/* Local tile */}
+        {/* self */}
         <div style={{ position: 'relative' }}>
           <div style={{ color: '#bbb', marginBottom: 6, fontSize: 14 }}>You</div>
           <div style={{
@@ -486,12 +525,11 @@ export default function ZoomMeetingComponent({
             overflow: 'hidden',
             boxShadow: '0 2px 10px rgba(0,0,0,.35)'
           }}>
-            <video
-              ref={selfVideoRef}
-              autoPlay
-              muted
-              playsInline
-              style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
+            <canvas
+              ref={selfCanvasRef}
+              width={320}
+              height={180}
+              style={{ width: '100%', height: '100%', display: 'block' }}
             />
             <div
               ref={selfLabelRef}
@@ -511,7 +549,7 @@ export default function ZoomMeetingComponent({
           </div>
         </div>
 
-        {/* Remotes */}
+        {/* remotes */}
         <div>
           <div style={{ color: '#bbb', marginBottom: 6, fontSize: 14 }}>Participants</div>
           <div
@@ -528,7 +566,7 @@ export default function ZoomMeetingComponent({
         </div>
       </div>
 
-      {/* Overlays */}
+      {/* overlays */}
       {joining && (
         <div style={{
           position: 'absolute', inset: 0, display: 'grid', placeItems: 'center',
@@ -555,7 +593,7 @@ export default function ZoomMeetingComponent({
                 {String(error)}
               </div>
             )}
-            {button(handleEnable, 'Enable mic & cam')}
+            <Btn onClick={handleEnable} label="Enable mic & cam" />
           </div>
         </div>
       )}
