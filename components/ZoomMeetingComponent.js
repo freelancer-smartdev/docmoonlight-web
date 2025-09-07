@@ -4,7 +4,7 @@ import axios from 'axios';
 import ZoomVideo from '@zoom/videosdk';
 
 const API_BASE = '/api';
-const BUILD = 'ZMC-v5-remote-debug-2025-09-07'; // <- verify this prints
+const BUILD = 'ZMC-v6-mobile-canvas-2025-09-07';
 
 const asArray = (x) => (Array.isArray(x) ? x : x ? [x] : []);
 const displayNameFor = (role, location) =>
@@ -40,14 +40,14 @@ function mapCameraError(e) {
   return 'Could not start camera';
 }
 
-/* ---------- find & instrument inner <video> so we know frames arrive ---------- */
+/* ---------- tiny helpers to introspect video/canvas ---------- */
 function findInnerVideo(root) {
   if (!root) return null;
   if (root.tagName?.toLowerCase() === 'video') return root;
   let v = root.querySelector?.('video') || null;
   if (v) return v;
   if (root.shadowRoot) v = root.shadowRoot.querySelector?.('video') || null;
-  return v || null;
+  return v || null; // may be null for closed shadow DOM (video-player)
 }
 function hookVideoDebug(el, label, dbg) {
   const v = findInnerVideo(el);
@@ -59,10 +59,55 @@ function hookVideoDebug(el, label, dbg) {
   let n = 0; const t = setInterval(() => { n++; dbg(`video.${label}.size`, { id, w: v.videoWidth, h: v.videoHeight }); if (n>=10) clearInterval(t); }, 1000);
 }
 
-/* ---------- REMOTES: attach into a container DIV ---------- */
-async function attachRemoteCompat(stream, userId, container, dbg) {
+/* ---------- REMOTES: attach helpers ---------- */
+function sizeOf(el) {
+  const r = el.getBoundingClientRect?.();
+  const w = Math.max(1, Math.round(r?.width || 640));
+  const h = Math.max(1, Math.round(r?.height || 360));
+  return { w, h };
+}
+
+/**
+ * Attach remote video.
+ * - On mobile we PREFER a canvas via renderVideo (more reliable on emulators).
+ * - On desktop we try attachVideo first (may return a <video-player>), then fall back to canvas.
+ */
+async function attachRemoteCompat(stream, userId, container, dbg, preferCanvas) {
   const Q = (ZoomVideo?.VideoQuality?.Video_360P) ?? 2;
 
+  const attachViaCanvas = async () => {
+    const canvas = document.createElement('canvas');
+    Object.assign(canvas.style, { width:'100%', height:'100%', display:'block', background:'#111' });
+    container.replaceChildren(canvas);
+
+    const { w, h } = sizeOf(container);
+    dbg('remote.canvas.render.begin', { userId, w, h });
+    await maybeAwait(stream.renderVideo(canvas, userId, w, h, 0, 0));
+    dbg('remote.canvas.render.ok', { userId, w, h });
+
+    // keep canvas sized to container
+    if ('ResizeObserver' in window) {
+      const ro = new ResizeObserver(async () => {
+        const { w: nw, h: nh } = sizeOf(container);
+        try {
+          dbg('remote.canvas.resize', { userId, w: nw, h: nh });
+          await maybeAwait(stream.renderVideo(canvas, userId, nw, nh, 0, 0));
+        } catch (e) {
+          dbg('remote.canvas.resize.fail', { userId, err: niceErr(e) });
+        }
+      });
+      ro.observe(container);
+      canvas._ro = ro; // stash for cleanup
+    }
+    return canvas;
+  };
+
+  if (preferCanvas) {
+    try { return await attachViaCanvas(); }
+    catch (e) { dbg('remote.canvas.preferred.fail', { userId, err: niceErr(e) }); }
+  }
+
+  // Try new API first: attachVideo(userId, quality, container)
   try {
     dbg('remote.attach.new', { userId, target: tag(container) });
     const maybeEl = await maybeAwait(stream.attachVideo(userId, Q, container));
@@ -73,7 +118,7 @@ async function attachRemoteCompat(stream, userId, container, dbg) {
     dbg('remote.attach.new.fail', { userId, err: niceErr(e) });
   }
 
-  // Old API: create a <video> and try legacy signatures
+  // Old API path: create a <video> and try legacy signatures
   try {
     const video = document.createElement('video');
     video.autoplay = true; video.playsInline = true; video.muted = true;
@@ -95,25 +140,15 @@ async function attachRemoteCompat(stream, userId, container, dbg) {
     dbg('remote.attach.old.fail', { userId, err: niceErr(e2) });
   }
 
-  // Last-ditch: renderVideo(canvas)
-  try {
-    const canvas = document.createElement('canvas');
-    Object.assign(canvas.style, { width:'100%', height:'100%', display:'block', background:'#111' });
-    container.replaceChildren(canvas);
-    const rect = container.getBoundingClientRect?.() || { width: 640, height: 360 };
-    dbg('remote.renderVideo.fallback', { userId, w: rect.width|0, h: rect.height|0 });
-    await maybeAwait(stream.renderVideo(canvas, userId, (rect.width|0)||640, (rect.height|0)||360, 0, 0));
-    return canvas;
-  } catch (e3) {
-    dbg('remote.renderVideo.fail', { userId, err: niceErr(e3) });
-    throw new Error('Could not attach remote video');
-  }
+  // Last fallback: canvas
+  return await attachViaCanvas();
 }
 
 async function detachRemoteCompat(stream, userId, el, dbg) {
   try { dbg('remote.detach.new', { userId }); await maybeAwait(stream.detachVideo?.(userId)); }
   catch { try { dbg('remote.detach.old', { userId, target: tag(el) }); await maybeAwait(stream.detachVideo?.(el, userId)); }
   catch { try { await maybeAwait(stream.stopRender?.(userId)); } catch {} } }
+  if (el && el._ro && el._ro.disconnect) try { el._ro.disconnect(); } catch {}
 }
 
 /* ---------- COMPONENT ---------- */
@@ -225,10 +260,21 @@ export default function ZoomMeetingComponent({
         return;
       }
 
-      const el = await attachRemoteCompat(media, uid, tile.slot, dbg);
+      // Prefer canvas on mobile
+      const preferCanvas = isMobileUA;
+      const el = await attachRemoteCompat(media, uid, tile.slot, dbg, preferCanvas);
       tile.actual = el;
       dbg('remote.attach.ok', { uid, attempt, actual: tag(el) });
-      hookVideoDebug(el, `remote-${uid}`, dbg);
+
+      if (tag(el) !== 'canvas') hookVideoDebug(el, `remote-${uid}`, dbg);
+      else {
+        // poll size a few times so we at least see canvas sizing
+        const id = `remote-${uid}-${Math.random().toString(36).slice(2,6)}`;
+        let n = 0; const t = setInterval(() => {
+          n++; const r = el.getBoundingClientRect?.(); dbg('canvas.remote.size', { id, w: Math.round(r?.width||0), h: Math.round(r?.height||0) });
+          if (n>=10) clearInterval(t);
+        }, 1000);
+      }
     } catch (e) {
       dbg('remote.attach.fail', { uid, attempt, err: niceErr(e) });
       if (attempt < 6) { await sleep(260); return attachRemote(uid, attempt + 1); }
