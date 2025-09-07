@@ -4,7 +4,7 @@ import axios from 'axios';
 import ZoomVideo from '@zoom/videosdk';
 
 const API_BASE = '/api';
-const BUILD = 'ZMC-v4-remote-debug-2025-09-07';
+const BUILD = 'ZMC-v5-remote-debug-2025-09-07'; // <- verify this prints
 
 const asArray = (x) => (Array.isArray(x) ? x : x ? [x] : []);
 const displayNameFor = (role, location) =>
@@ -40,7 +40,7 @@ function mapCameraError(e) {
   return 'Could not start camera';
 }
 
-/* ---------- helpers to debug actual <video> playback ---------- */
+/* ---------- find & instrument inner <video> so we know frames arrive ---------- */
 function findInnerVideo(root) {
   if (!root) return null;
   if (root.tagName?.toLowerCase() === 'video') return root;
@@ -49,42 +49,14 @@ function findInnerVideo(root) {
   if (root.shadowRoot) v = root.shadowRoot.querySelector?.('video') || null;
   return v || null;
 }
-
 function hookVideoDebug(el, label, dbg) {
   const v = findInnerVideo(el);
-  if (!v) {
-    dbg('video.debug.no-inner-video', { label, tag: tag(el) });
-    return;
-  }
-  const id = `${label}-${Math.random().toString(36).slice(2, 8)}`;
-  const log = (ev) =>
-    dbg(`video.${label}.${ev.type}`, {
-      id,
-      rs: v.readyState,
-      w: v.videoWidth,
-      h: v.videoHeight,
-    });
-  [
-    'loadedmetadata',
-    'loadeddata',
-    'canplay',
-    'play',
-    'playing',
-    'pause',
-    'waiting',
-    'stalled',
-    'error',
-    'resize',
-    'emptied',
-    'ended',
-  ].forEach((e) => v.addEventListener(e, log));
-  // poll a few times so you can see width/height evolve
-  let n = 0;
-  const t = setInterval(() => {
-    n += 1;
-    dbg(`video.${label}.size`, { id, w: v.videoWidth, h: v.videoHeight });
-    if (n >= 10) clearInterval(t);
-  }, 1000);
+  if (!v) { dbg('video.debug.no-inner-video', { label, tag: tag(el) }); return; }
+  const id = `${label}-${Math.random().toString(36).slice(2,8)}`;
+  const log = (ev) => dbg(`video.${label}.${ev.type}`, { id, rs: v.readyState, w: v.videoWidth, h: v.videoHeight });
+  ['loadedmetadata','loadeddata','canplay','play','playing','pause','waiting','stalled','error','resize','emptied','ended']
+    .forEach((e) => v.addEventListener(e, log));
+  let n = 0; const t = setInterval(() => { n++; dbg(`video.${label}.size`, { id, w: v.videoWidth, h: v.videoHeight }); if (n>=10) clearInterval(t); }, 1000);
 }
 
 /* ---------- REMOTES: attach into a container DIV ---------- */
@@ -101,20 +73,21 @@ async function attachRemoteCompat(stream, userId, container, dbg) {
     dbg('remote.attach.new.fail', { userId, err: niceErr(e) });
   }
 
-  // Old API needs <video>
+  // Old API: create a <video> and try legacy signatures
   try {
     const video = document.createElement('video');
     video.autoplay = true; video.playsInline = true; video.muted = true;
     Object.assign(video.style, { width:'100%', height:'100%', objectFit:'cover', display:'block', background:'#111' });
     container.replaceChildren(video);
 
-    try { // attachVideo(video, userId)
+    try {
       dbg('remote.attach.old.v1', { userId, target: 'video' });
       await maybeAwait(stream.attachVideo(video, userId));
       return video;
-    } catch (e1) { dbg('remote.attach.old.v1.fail', { userId, err: niceErr(e1) }); }
+    } catch (e1) {
+      dbg('remote.attach.old.v1.fail', { userId, err: niceErr(e1) });
+    }
 
-    // attachVideo(userId, video)
     dbg('remote.attach.old.v2', { userId, target: 'video' });
     const res = await maybeAwait(stream.attachVideo(userId, video));
     return (res && res.nodeType === 1) ? res : video;
@@ -169,7 +142,7 @@ export default function ZoomMeetingComponent({
   const [cams, setCams] = useState([]);
   const [camId, setCamId] = useState('');
 
-  // Debug
+  // Debug overlay
   const [debug, setDebug] = useState(false);
   const [debugLines, setDebugLines] = useState([]);
   useEffect(() => {
@@ -255,8 +228,6 @@ export default function ZoomMeetingComponent({
       const el = await attachRemoteCompat(media, uid, tile.slot, dbg);
       tile.actual = el;
       dbg('remote.attach.ok', { uid, attempt, actual: tag(el) });
-
-      // try to hook into inner <video> for “am I seeing frames” debugging
       hookVideoDebug(el, `remote-${uid}`, dbg);
     } catch (e) {
       dbg('remote.attach.fail', { uid, attempt, err: niceErr(e) });
@@ -330,6 +301,8 @@ export default function ZoomMeetingComponent({
         await client.init('en-US', 'Global', { patchJsMedia: true });
         await client.join(sessionName, sessionToken, myDisplayName);
 
+        const meId = client.getCurrentUserInfo()?.userId;
+        dbg('session', { sessionName, meId });
         if (selfLabelRef.current) selfLabelRef.current.textContent = `You — ${myDisplayName}`;
 
         // media
@@ -348,10 +321,9 @@ export default function ZoomMeetingComponent({
         setMicOn(false); setCamOn(false); setNeedsGesture(true);
 
         // hydrate remotes
-        const me = client.getCurrentUserInfo()?.userId;
         logUsers(client, 'after-join');
         (client.getAllUser() || []).forEach((u) => {
-          if (u.userId !== me) {
+          if (u.userId !== meId) {
             ensureRemoteTile(u);
             if (u.bVideoOn) attachRemote(u.userId);
           }
@@ -379,9 +351,9 @@ export default function ZoomMeetingComponent({
           asArray(list).forEach((u) => removeRemoteTile(u.userId));
         };
         const onPeerVideo = ({ action, userId }) => {
-          const meId = client.getCurrentUserInfo()?.userId;
-          dbg('peer-video-state-change', { action, userId, meId });
-          if (userId === meId) return; // ignore our own camera events
+          const meIdNow = client.getCurrentUserInfo()?.userId;
+          dbg('peer-video-state-change', { action, userId, meId: meIdNow });
+          if (userId === meIdNow) return; // ignore our own camera events
           if (action === 'Start') attachRemote(userId, 0);
           else detachRemote(userId);
         };
@@ -450,7 +422,7 @@ export default function ZoomMeetingComponent({
       tmp.getTracks().forEach((t) => t.stop());
     } catch (e) { setError(mapCameraError(e)); return; }
 
-    // Start video by binding directly to the <video> element (this is the key fix)
+    // Start video by binding directly to the <video> element
     const el = selfVideoRef.current;
     try {
       dbg('self.startVideo.withElement', { deviceId: camId || '(default)', tag: tag(el) });
@@ -458,8 +430,6 @@ export default function ZoomMeetingComponent({
       dbg('self.startVideo.withElement.ok');
       setCamOn(true);
       setNeedsGesture(false);
-
-      // hook into inner <video> to prove frames are coming out locally
       hookVideoDebug(el, 'self', dbg);
     } catch (e1) {
       dbg('self.startVideo.withElement.fail', { err: niceErr(e1) });
