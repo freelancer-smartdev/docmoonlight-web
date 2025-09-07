@@ -521,4 +521,155 @@ export default function ZoomMeetingComponent({
       try { maybeAwait(media?.stopAudio()); } catch {}
       try { client?.leave(); } catch {}
 
-      cli
+      clientRef.current = null;
+      mediaRef.current  = null;
+    };
+  }, [callId, locationName, role, userId, token]);
+
+  /* ---- Self camera ---- */
+  const startCam = async () => {
+    setError('');
+    const media = mediaRef.current;
+    const client = clientRef.current;
+    if (!media || !client) return;
+
+    // Pre-warm permission with the chosen device for clearer errors
+    try {
+      const constraints = camId ? { video: { deviceId: { exact: camId } } } : { video: true };
+      const tmp = await navigator.mediaDevices.getUserMedia(constraints);
+      tmp.getTracks().forEach((t) => t.stop());
+    } catch (e) { setError(mapCameraError(e)); return; }
+
+    const el = selfVideoRef.current;
+    try {
+      dbg('self.startVideo.withElement', { deviceId: camId || '(default)', tag: tag(el) });
+      await maybeAwait(media.startVideo({ deviceId: camId || undefined, videoElement: el }));
+      dbg('self.startVideo.withElement.ok');
+      setCamOn(true);
+      setNeedsGesture(false);
+      hookVideoDebug(el, 'self', dbg);
+    } catch (e1) {
+      dbg('self.startVideo.withElement.fail', { err: niceErr(e1) });
+      setError(mapCameraError(e1) || 'Could not start camera');
+    }
+  };
+
+  const stopCam = async () => { try { await maybeAwait(mediaRef.current?.stopVideo()); } catch {} setCamOn(false); };
+
+  // Camera switch
+  useEffect(() => {
+    (async () => {
+      const media = mediaRef.current;
+      if (!media || !camOn || !camId) return;
+      try {
+        if (media.switchCamera) { await maybeAwait(media.switchCamera(camId)); dbg('switchCamera.ok', { camId }); }
+        else { await maybeAwait(media.stopVideo()); await startCam(); }
+      } catch (e) { console.warn('[ZMC] switchCamera FAIL', e); }
+    })();
+  }, [camId, camOn]);
+
+  const toggleCam = async () => (camOn ? stopCam() : startCam());
+
+  /* ---- Mic ---- */
+  const toggleMic = async () => {
+    const media = mediaRef.current;
+    if (!media) return;
+    try {
+      if (micOn) { await maybeAwait(media.stopAudio()); setMicOn(false); }
+      else       { await maybeAwait(media.startAudio()); setMicOn(true); }
+    } catch (e) {
+      setError('Microphone error: ' + (e?.reason || e?.message || 'unknown'));
+    }
+  };
+
+  const handleEnable = async () => { await startCam(); await toggleMic(); };
+
+  /* ---- UI ---- */
+  return (
+    <div style={{ width: '100%', height: '100%', display: 'grid', gridTemplateRows: 'auto 1fr', background: '#000', color: '#fff' }}>
+      <div style={{ padding: 12, display: 'flex', alignItems: 'center', gap: 10, background: 'rgba(255,255,255,.06)', borderBottom: '1px solid rgba(255,255,255,.07)' }}>
+        <strong style={{ letterSpacing: '.2px' }}>{locationName ? `Clinic – ${locationName}` : 'Clinic'}</strong>
+
+        {cams.length > 1 && (
+          <select value={camId} onChange={(e) => setCamId(e.target.value)}
+                  style={{ marginLeft: 12, background: '#111', color: '#fff', borderRadius: 6, border: '1px solid #333', padding: '4px 8px' }}
+                  title="Camera">
+            {cams.map((c) => (<option key={c.deviceId} value={c.deviceId}>{c.label || 'Camera'}</option>))}
+          </select>
+        )}
+
+        <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+          <button onClick={toggleMic}
+                  style={{ padding: '6px 12px', borderRadius: 8, border: 0, background: micOn ? '#2e8b57' : '#666', color: '#fff' }}>
+            {micOn ? 'Mic On' : 'Mic Off'}
+          </button>
+          <button onClick={toggleCam}
+                  style={{ padding: '6px 12px', borderRadius: 8, border: 0, background: camOn ? '#2e8b57' : '#666', color: '#fff' }}>
+            {camOn ? 'Cam On' : 'Cam Off'}
+          </button>
+          <button
+            onClick={() => {
+              try { maybeAwait(mediaRef.current?.stopVideo()); } catch {}
+              try { maybeAwait(mediaRef.current?.stopAudio()); } catch {}
+              try { clientRef.current?.leave(); } catch {}
+            }}
+            style={{ padding: '6px 12px', borderRadius: 8, background: '#d33', color: '#fff', border: 0 }}
+          >
+            Leave
+          </button>
+        </div>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(280px,360px) 1fr', gap: 14, padding: 14 }}>
+        {/* Self (VIDEO element) */}
+        <div style={{ position: 'relative' }}>
+          <div style={{ color: '#bbb', marginBottom: 6, fontSize: 14 }}>You</div>
+          <div style={{ position: 'relative', width: '100%', height: 220, background: '#111', borderRadius: 12, overflow: 'hidden', boxShadow: '0 2px 10px rgba(0,0,0,.35)' }}>
+            <video ref={selfVideoRef} autoPlay muted playsInline style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
+            <div ref={selfLabelRef} style={{ position: 'absolute', left: 10, bottom: 8, padding: '3px 8px', fontSize: 12, background: 'rgba(0,0,0,.55)', borderRadius: 6, letterSpacing: '.2px' }}>You</div>
+          </div>
+        </div>
+
+        {/* Remotes (grid of tiles) */}
+        <div>
+          <div style={{ color: '#bbb', marginBottom: 6, fontSize: 14 }}>Participants</div>
+          <div ref={remoteGridRef} id="remote-grid"
+               style={{ width: '100%', minHeight: 220, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12 }} />
+        </div>
+      </div>
+
+      {joining && (
+        <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,.35)', fontSize: 16 }}>
+          Connecting to session…
+        </div>
+      )}
+
+      {(needsGesture || !!error) && (
+        <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,.45)' }}>
+          <div style={{ display: 'grid', gap: 10, placeItems: 'center' }}>
+            {!!error && (
+              <div style={{ background: 'rgba(220,0,0,.85)', padding: '8px 12px', borderRadius: 6, maxWidth: 520, lineHeight: 1.35 }}>
+                {String(error)}
+              </div>
+            )}
+            <button onClick={handleEnable}
+                    style={{ padding: '10px 14px', borderRadius: 8, border: 0, background: '#1f8fff', color: '#fff', fontWeight: 600 }}>
+              Enable mic & cam
+            </button>
+          </div>
+        </div>
+      )}
+
+      {debug && (
+        <div style={{
+          position: 'absolute', right: 8, bottom: 8, width: 420, maxHeight: 300, overflow: 'auto',
+          fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 11,
+          background: 'rgba(0,0,0,.55)', border: '1px solid rgba(255,255,255,.12)',
+          borderRadius: 6, padding: 8, whiteSpace: 'pre-wrap'
+        }}>
+          {debugLines.join('\n')}
+        </div>
+      )}
+    </div>
+  );
+}
