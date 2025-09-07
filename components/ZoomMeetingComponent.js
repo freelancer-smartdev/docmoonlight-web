@@ -4,7 +4,7 @@ import axios from 'axios';
 import ZoomVideo from '@zoom/videosdk';
 
 const API_BASE = '/api';
-const BUILD = 'ZMC-v6-mobile-canvas-2025-09-07';
+const BUILD = 'ZMC-v6.1-mobile-canvas-fix-2025-09-07';
 
 const asArray = (x) => (Array.isArray(x) ? x : x ? [x] : []);
 const displayNameFor = (role, location) =>
@@ -69,8 +69,8 @@ function sizeOf(el) {
 
 /**
  * Attach remote video.
- * - On mobile we PREFER a canvas via renderVideo (more reliable on emulators).
- * - On desktop we try attachVideo first (may return a <video-player>), then fall back to canvas.
+ * - On mobile or when ?forceCanvas=1 we prefer a <canvas> via renderVideo (more robust in emulators).
+ * - Otherwise try attachVideo first (may return a <video-player>), then fall back to canvas.
  */
 async function attachRemoteCompat(stream, userId, container, dbg, preferCanvas) {
   const Q = (ZoomVideo?.VideoQuality?.Video_360P) ?? 2;
@@ -103,8 +103,12 @@ async function attachRemoteCompat(stream, userId, container, dbg, preferCanvas) 
   };
 
   if (preferCanvas) {
-    try { return await attachViaCanvas(); }
-    catch (e) { dbg('remote.canvas.preferred.fail', { userId, err: niceErr(e) }); }
+    try {
+      dbg('remote.attach.mode', { userId, mode: 'canvas-preferred' });
+      return await attachViaCanvas();
+    } catch (e) {
+      dbg('remote.canvas.preferred.fail', { userId, err: niceErr(e) });
+    }
   }
 
   // Try new API first: attachVideo(userId, quality, container)
@@ -171,8 +175,10 @@ export default function ZoomMeetingComponent({
   const [micOn, setMicOn]     = useState(false);
   const [camOn, setCamOn]     = useState(false);
 
-  const isMobileUA = typeof navigator !== 'undefined' && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
-  const forceCanvasParam = typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('forceCanvas');
+  const isMobileUA =
+    typeof navigator !== 'undefined' && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+  const forceCanvasParam =
+    typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('forceCanvas');
   const preferCanvas = isMobileUA || forceCanvasParam;
 
   const [needsGesture, setNeedsGesture] = useState(isMobileUA);
@@ -263,8 +269,7 @@ export default function ZoomMeetingComponent({
         return;
       }
 
-      // Prefer canvas on mobile
-      const preferCanvas = isMobileUA;
+      // ✅ Use the component-level preferCanvas (mobile OR ?forceCanvas=1)
       const el = await attachRemoteCompat(media, uid, tile.slot, dbg, preferCanvas);
       tile.actual = el;
       dbg('remote.attach.ok', { uid, attempt, actual: tag(el) });
