@@ -3,11 +3,14 @@ import { useEffect, useRef, useState } from 'react';
 import axios from 'axios';
 import ZoomVideo from '@zoom/videosdk';
 
+const BUILD = 'ZMC-2025-09-07c';
+console.info('[ZMC] build:', BUILD);
+
 const API_BASE = '/api';
 
 const asArray = (x) => (Array.isArray(x) ? x : x ? [x] : []);
 const displayNameFor = (role, location) =>
-  role === 1 ? `Doctor – ${location || ''}` : `Clinic – ${location || ''}`;
+  Number(role) === 1 ? `Doctor – ${location || ''}` : `Clinic – ${location || ''}`;
 
 /** Decode a JWT payload (base64url → JSON). */
 function decodeJwtPayload(token) {
@@ -35,96 +38,97 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function mapCameraError(e) {
   const s = (e?.name || e?.message || e?.reason || '').toLowerCase();
+  if (/video is started/i.test(s)) return ''; // harmless
   if (/notallowed|permission|denied/i.test(s)) return 'Camera permission blocked';
   if (/notreadable|in use|busy|trackstart/i.test(s)) return 'Camera is in use by another app';
   if (/notfound|overconstrained|no suitable device|device not found/i.test(s)) return 'No camera found';
-  if (/video is started/i.test(s)) return ''; // treat as success
   return 'Could not start camera';
 }
 
 const tag = (el) => (el && el.tagName ? el.tagName.toLowerCase() : String(el));
 
-/** Try multiple attach signatures with a strict <video> element. */
-async function attachVideoBest(stream, userId, videoEl, dbg) {
+/** Attach video – prefer NEW API (container DIV); fall back to OLD API (<video>, userId). */
+async function attachVideoCompat(stream, userId, slot, dbg) {
   const Q = (ZoomVideo?.VideoQuality?.Video_360P) ?? 2;
 
-  // 1) attachVideo(userId, quality, videoEl)
+  // NEW API: attachVideo(userId, quality, element?) — element can be a container
   try {
-    dbg?.('attach.try1 attachVideo(userId,quality,videoEl)', { userId, tag: tag(videoEl) });
-    const el = await maybeAwait(stream.attachVideo(userId, Q, videoEl));
-    return el && el.nodeType === 1 ? el : videoEl;
-  } catch (e1) {
-    dbg?.('attach.try1 fail', { err: String(e1) });
+    dbg?.('attach.new', { userId, target: tag(slot) });
+    const maybeEl = await maybeAwait(stream.attachVideo(userId, Q, slot));
+    const el = (maybeEl && maybeEl.nodeType === 1) ? maybeEl : slot;
+    if (el && el !== slot && slot?.parentNode) slot.parentNode.replaceChild(el, slot);
+    return el || slot;
+  } catch (e) {
+    dbg?.('attach.new.fail', { err: String(e) });
   }
 
-  // 2) attachVideo(userId, videoEl)
-  try {
-    dbg?.('attach.try2 attachVideo(userId,videoEl)', { userId, tag: tag(videoEl) });
-    const el = await maybeAwait(stream.attachVideo(userId, videoEl));
-    return el && el.nodeType === 1 ? el : videoEl;
-  } catch (e2) {
-    dbg?.('attach.try2 fail', { err: String(e2) });
+  // OLD API needs a <video>
+  let videoEl = slot;
+  if (!videoEl || tag(videoEl) !== 'video') {
+    const container = slot?.nodeType === 1 ? slot : document.createElement('div');
+    videoEl = document.createElement('video');
+    videoEl.autoplay = true;
+    videoEl.playsInline = true;
+    videoEl.muted = true;
+    Object.assign(videoEl.style, {
+      width: '100%', height: '100%', objectFit: 'cover', display: 'block', background: '#111',
+    });
+    container.appendChild(videoEl);
+    if (container !== slot && slot?.parentNode) slot.parentNode.replaceChild(container, slot);
   }
 
-  // 3) attachVideo(videoEl, userId)  (oldest)
+  // OLD signatures
   try {
-    dbg?.('attach.try3 attachVideo(videoEl,userId)', { userId, tag: tag(videoEl) });
+    dbg?.('attach.old.v1', { userId, target: tag(videoEl) }); // attachVideo(videoEl, userId)
     await maybeAwait(stream.attachVideo(videoEl, userId));
     return videoEl;
-  } catch (e3) {
-    dbg?.('attach.try3 fail', { err: String(e3) });
+  } catch (e1) {
+    dbg?.('attach.old.v1.fail', { err: String(e1) });
   }
-
-  // 4) renderVideo(videoEl, userId, w, h, x, y) as last-ditch
   try {
-    const rect = videoEl.getBoundingClientRect();
-    const w = Math.max(2, Math.floor(rect.width || 640));
-    const h = Math.max(2, Math.floor(rect.height || 360));
-    dbg?.('attach.try4 renderVideo(videoEl,...)', { userId, w, h });
-    await maybeAwait(stream.renderVideo(videoEl, userId, w, h, 0, 0));
-    return videoEl;
-  } catch (e4) {
-    dbg?.('attach.try4 fail', { err: String(e4) });
+    dbg?.('attach.old.v2', { userId, target: tag(videoEl) }); // attachVideo(userId, videoEl)
+    const el = await maybeAwait(stream.attachVideo(userId, videoEl));
+    return (el && el.nodeType === 1) ? el : videoEl;
+  } catch (e2) {
+    dbg?.('attach.old.v2.fail', { err: String(e2) });
   }
 
   throw new Error('attachVideo: all signatures failed');
 }
 
-/** Detach across API variants. */
-async function detachVideoBest(stream, userId, videoEl, dbg) {
+/** Detach video – supports both new and old API forms. */
+async function detachVideoCompat(stream, userId, el, dbg) {
   try {
     dbg?.('detach.new', { userId });
     await maybeAwait(stream.detachVideo?.(userId));
-    return;
-  } catch {}
-  try {
-    dbg?.('detach.old', { userId, tag: tag(videoEl) });
-    await maybeAwait(stream.detachVideo?.(videoEl, userId));
-    return;
-  } catch {}
-  try { await maybeAwait(stream.stopRender?.(userId)); } catch {}
+  } catch {
+    try {
+      dbg?.('detach.old', { userId, target: tag(el) });
+      await maybeAwait(stream.detachVideo?.(el, userId));
+    } catch {
+      try { await maybeAwait(stream.stopRender?.(userId)); } catch {}
+    }
+  }
 }
 
-/** Start local camera: do NOT pass element to startVideo (avoids “Invalid element type”). */
-async function startVideoBest(stream, deviceId, dbg) {
-  // 1) With deviceId only
+/** Start local camera — NEVER pass an element here (avoids “Invalid element type”). */
+async function startVideoCompat(stream, deviceId, dbg) {
   if (deviceId) {
     try {
-      dbg?.('startVideo.try1 startVideo({deviceId})', { deviceId });
+      dbg?.('startVideo.opts', { deviceId });
       await maybeAwait(stream.startVideo({ deviceId }));
       return;
     } catch (e1) {
-      dbg?.('startVideo.try1 fail', { err: String(e1) });
+      dbg?.('startVideo.opts.fail', { err: String(e1) });
       if (/video is started/i.test(String(e1))) return; // benign
     }
   }
-  // 2) Plain
   try {
-    dbg?.('startVideo.try2 startVideo()');
+    dbg?.('startVideo.plain');
     await maybeAwait(stream.startVideo());
   } catch (e2) {
-    dbg?.('startVideo.try2 fail', { err: String(e2) });
-    if (/video is started/i.test(String(e2))) return; // benign
+    dbg?.('startVideo.plain.fail', { err: String(e2) });
+    if (/video is started/i.test(String(e2))) return;
     throw e2;
   }
 }
@@ -140,10 +144,11 @@ export default function ZoomMeetingComponent({
   const clientRef = useRef(null);
   const mediaRef  = useRef(null);
 
-  const selfVideoRef = useRef(null); // keep as <video>
+  // self uses a CONTAINER DIV (SDK will inject its own element if needed)
+  const selfSlotRef  = useRef(null);
   const selfLabelRef = useRef(null);
 
-  // userId -> { wrapper, video, label }
+  // userId -> { wrapper, slot, label, video?: HTMLElement }
   const remoteTilesRef = useRef(new Map());
   const remoteGridRef  = useRef(null);
 
@@ -177,7 +182,7 @@ export default function ZoomMeetingComponent({
     else console.log('[VideoSDK]', msg);
   };
 
-  // ---------- Remote tile helpers (strict <video>) ----------
+  // ---------- Remote tile helpers (slot DIV) ----------
   const ensureRemoteTile = (user) => {
     const uid = user.userId;
     let tile = remoteTilesRef.current.get(uid);
@@ -197,14 +202,10 @@ export default function ZoomMeetingComponent({
       display: 'grid',
     });
 
-    const video = document.createElement('video');
-    video.autoplay = true;
-    video.playsInline = true;
-    video.muted = true; // audio is mixed by SDK
-    Object.assign(video.style, {
+    const slot = document.createElement('div'); // act as container for new API
+    Object.assign(slot.style, {
       width: '100%',
       height: '100%',
-      objectFit: 'cover',
       display: 'block',
       background: '#111',
     });
@@ -224,11 +225,11 @@ export default function ZoomMeetingComponent({
       pointerEvents: 'none',
     });
 
-    wrapper.appendChild(video);
+    wrapper.appendChild(slot);
     wrapper.appendChild(label);
     remoteGridRef.current?.appendChild(wrapper);
 
-    tile = { wrapper, video, label };
+    tile = { wrapper, slot, label, video: null };
     remoteTilesRef.current.set(uid, tile);
     return tile;
   };
@@ -247,9 +248,9 @@ export default function ZoomMeetingComponent({
         return;
       }
 
-      const el = await attachVideoBest(media, uid, tile.video, dbg);
-      if (el && el !== tile.video) tile.video = el;
-      dbg('remote.attach ok', { uid, attempt, tag: tag(tile.video) });
+      const el = await attachVideoCompat(media, uid, tile.slot, dbg);
+      if (el && el !== tile.slot) tile.video = el; // keep actual element for detach (old API)
+      dbg('remote.attach ok', { uid, attempt, used: tag(el) });
     } catch (e) {
       const msg = e?.reason || e?.message || String(e);
       dbg('remote.attach fail', { uid, attempt, err: msg });
@@ -262,7 +263,7 @@ export default function ZoomMeetingComponent({
 
   const detachRemote = async (uid) => {
     const tile = remoteTilesRef.current.get(uid);
-    try { await detachVideoBest(mediaRef.current, uid, tile?.video, dbg); } catch {}
+    try { await detachVideoCompat(mediaRef.current, uid, tile?.video || tile?.slot, dbg); } catch {}
   };
 
   const removeRemoteTile = async (uid) => {
@@ -272,7 +273,7 @@ export default function ZoomMeetingComponent({
     remoteTilesRef.current.delete(uid);
   };
 
-  // ---------- Start cam (no element passed to startVideo) ----------
+  // ---------- Start camera (no element passed to startVideo) ----------
   const startCamInternal = async (preferredId) => {
     setError('');
     const client = clientRef.current;
@@ -292,7 +293,7 @@ export default function ZoomMeetingComponent({
       }
     } catch {}
 
-    // Pre-warm exact deviceId to surface permission/busy quickly
+    // Pre-warm permission using the SAME device id (optional but helpful for error clarity)
     try {
       const constraints = selected ? { video: { deviceId: { exact: selected } } } : { video: true };
       const tmp = await navigator.mediaDevices.getUserMedia(constraints);
@@ -302,9 +303,9 @@ export default function ZoomMeetingComponent({
       return false;
     }
 
-    // Start video (no element)
+    // Start video (no DOM element here)
     try {
-      await startVideoBest(media, selected, dbg);
+      await startVideoCompat(media, selected, dbg);
     } catch (e) {
       const msg = mapCameraError(e);
       if (msg) { setError(msg); return false; }
@@ -313,9 +314,8 @@ export default function ZoomMeetingComponent({
     // Self preview attach
     try {
       const me = client.getCurrentUserInfo()?.userId;
-      if (selfVideoRef.current && me != null) {
-        const el = await attachVideoBest(media, me, selfVideoRef.current, dbg);
-        if (el && el !== selfVideoRef.current) selfVideoRef.current = el;
+      if (selfSlotRef.current && me != null) {
+        await attachVideoCompat(media, me, selfSlotRef.current, dbg);
       }
       setCamOn(true);
       setNeedsGesture(false);
@@ -349,7 +349,7 @@ export default function ZoomMeetingComponent({
           if (!sessionName) throw new Error('Token is missing session name (tpc).');
         } else {
           const payload = {
-            role: role ? 1 : 0,
+            role: Number(role) ? 1 : 0,
             user_id: userId ?? undefined,
             call_id: callId,
             userName: displayNameFor(role, locationName),
@@ -363,6 +363,7 @@ export default function ZoomMeetingComponent({
             { headers: { 'Content-Type': 'application/json' } }
           );
 
+          // If backend chose Meeting SDK redirect, bounce to Zoom web client
           if (data?.meetingNumber) {
             const url = new URL(`https://app.zoom.us/wc/join/${data.meetingNumber}`);
             if (data.password) url.searchParams.set('pwd', data.password);
@@ -403,15 +404,10 @@ export default function ZoomMeetingComponent({
           }
         } catch {}
 
-        // Defer AUDIO to user gesture (mobile/safari friendly)
+        // DO NOT auto-start camera/audio (avoids “Video is started” races)
         setMicOn(false);
-
-        // Desktop convenience: attempt to start cam now; mobile waits for gesture
-        if (!isMobileUA) {
-          await startCamInternal();
-        } else {
-          setNeedsGesture(true);
-        }
+        setCamOn(false);
+        setNeedsGesture(true);
 
         // 4) Current remotes
         const me = client.getCurrentUserInfo()?.userId;
@@ -443,7 +439,7 @@ export default function ZoomMeetingComponent({
         const onPeerVideo = ({ action, userId }) => {
           dbg('peer-video-state-change', { action, userId });
           if (action === 'Start') attachRemote(userId, 0);
-          else detachRemote(userId); // leave tile; just blank out
+          else detachRemote(userId); // keep tile
         };
 
         client.on('user-added', onAdded);
@@ -492,14 +488,14 @@ export default function ZoomMeetingComponent({
 
       try {
         remoteTilesRef.current.forEach(async (_, uid) => {
-          try { await detachVideoBest(media, uid, null, dbg); } catch {}
+          try { await detachVideoCompat(media, uid, null, dbg); } catch {}
         });
         remoteTilesRef.current.clear();
       } catch {}
 
       try {
         const me = client?.getCurrentUserInfo()?.userId;
-        if (me != null) detachVideoBest(media, me, selfVideoRef.current, dbg);
+        if (me != null) detachVideoCompat(media, me, selfSlotRef.current, dbg);
       } catch {}
 
       try { maybeAwait(media?.stopVideo()); } catch {}
@@ -509,8 +505,7 @@ export default function ZoomMeetingComponent({
       clientRef.current = null;
       mediaRef.current  = null;
     };
-  // important: do NOT depend on camId or debug here (prevents re-joins)
-  }, [callId, locationName, role, userId, token]);
+  }, [callId, locationName, role, userId, token]); // do NOT depend on camId/debug here
 
   // Switch camera without re-joining
   useEffect(() => {
@@ -554,7 +549,7 @@ export default function ZoomMeetingComponent({
   const handleEnable = async () => {
     setError('');
     const ok = await startCamInternal();
-    if (ok) await toggleMic(); // mic after cam (autoplay policy)
+    if (ok) await toggleMic(); // mic after cam is more reliable for autoplay
   };
 
   // ---------- UI ----------
@@ -624,7 +619,7 @@ export default function ZoomMeetingComponent({
         gridTemplateColumns: 'minmax(280px,360px) 1fr',
         gap: 14, padding: 14
       }}>
-        {/* Local tile */}
+        {/* Local tile (container DIV, not <video>) */}
         <div style={{ position: 'relative' }}>
           <div style={{ color: '#bbb', marginBottom: 6, fontSize: 14 }}>You</div>
           <div style={{
@@ -632,12 +627,9 @@ export default function ZoomMeetingComponent({
             background: '#111', borderRadius: 12, overflow: 'hidden',
             boxShadow: '0 2px 10px rgba(0,0,0,.35)'
           }}>
-            <video
-              ref={selfVideoRef}
-              autoPlay
-              muted
-              playsInline
-              style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
+            <div
+              ref={selfSlotRef}
+              style={{ width: '100%', height: '100%' }}
             />
             <div
               ref={selfLabelRef}
