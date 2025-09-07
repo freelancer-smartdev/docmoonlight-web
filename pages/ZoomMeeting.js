@@ -9,6 +9,17 @@ const ZoomMeetingComponent = dynamic(
 );
 
 export default function ZoomMeeting() {
+  useEffect(() => {
+    const html = document.documentElement;
+    const body = document.body;
+    html.classList.add("is-meeting-page");
+    body.classList.add("is-meeting-page");
+
+    return () => {
+      html.classList.remove("is-meeting-page");
+      body.classList.remove("is-meeting-page");
+    };
+  }, []);
   const { query } = useRouter();
 
   const callId =

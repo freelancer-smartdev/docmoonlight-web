@@ -226,3 +226,27 @@ height: auto;
 ::-webkit-scrollbar {
   display: none;
 }
+
+/* Zoom Meeting page (mobile only) */
+@media (max-width: 768px) {
+  html.is-meeting-page,
+  body.is-meeting-page {
+    /* Fill the dynamic viewport and kill right/bottom gaps */
+    height: 100%;
+    min-height: 100dvh;
+    width: 100% !important;   /* overrides body inline 100vw the SDK sets */
+    max-width: 100%;
+    margin: 0;
+    padding: 0;
+    overflow: hidden !important;
+    background: #000;
+  }
+
+  /* Make the Next.js root fill the screen too */
+  body.is-meeting-page #__next {
+    height: 100%;
+    min-height: 100dvh;
+    width: 100%;
+    max-width: 100%;
+  }
+}
