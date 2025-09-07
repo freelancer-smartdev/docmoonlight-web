@@ -4,13 +4,12 @@ import axios from 'axios';
 import ZoomVideo from '@zoom/videosdk';
 
 const API_BASE = '/api';
-const BUILD = 'ZMC-selfVideoElement-2025-09-07';
+const BUILD = 'ZMC-selfVideoElement-2025-09-07b';
 
 const asArray = (x) => (Array.isArray(x) ? x : x ? [x] : []);
 const displayNameFor = (role, location) =>
   Number(role) === 1 ? `Doctor – ${location || ''}` : `Clinic – ${location || ''}`;
 
-/** Decode a JWT payload (base64url → JSON). */
 function decodeJwtPayload(token) {
   try {
     const part = token.split('.')[1];
@@ -27,18 +26,10 @@ function decodeJwtPayload(token) {
   }
 }
 
-async function maybeAwait(v) {
-  if (v && typeof v.then === 'function') return await v;
-  return v;
-}
+async function maybeAwait(v) { if (v && typeof v.then === 'function') return await v; return v; }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const tag = (el) => (el && el.tagName ? el.tagName.toLowerCase() : String(el));
-
-const niceErr = (e) => {
-  if (!e) return '';
-  if (typeof e === 'string') return e;
-  return JSON.stringify({ name: e.name, message: e.message, reason: e.reason, code: e.code });
-};
+const niceErr = (e) => typeof e === 'string' ? e : JSON.stringify({ name: e?.name, message: e?.message, reason: e?.reason, code: e?.code });
 
 function mapCameraError(e) {
   const s = (e?.name || e?.message || e?.reason || '').toLowerCase();
@@ -49,40 +40,34 @@ function mapCameraError(e) {
   return 'Could not start camera';
 }
 
-/** REMOTE: attach into a container <div>. Swap in SDK's element if returned. */
+/* ---------- REMOTES: attach into a container DIV ---------- */
 async function attachRemoteCompat(stream, userId, container, dbg) {
   const Q = (ZoomVideo?.VideoQuality?.Video_360P) ?? 2;
 
-  // New API: attachVideo(userId, quality, element?) — element can be a container
   try {
     dbg?.('remote.attach.new', { userId, target: tag(container) });
     const maybeEl = await maybeAwait(stream.attachVideo(userId, Q, container));
     const el = (maybeEl && maybeEl.nodeType === 1) ? maybeEl : container;
-    if (el !== container && container?.parentNode) {
-      container.parentNode.replaceChild(el, container);
-    }
+    if (el !== container && container?.parentNode) container.parentNode.replaceChild(el, container);
     return el;
   } catch (e) {
     dbg?.('remote.attach.new.fail', { err: niceErr(e) });
   }
 
-  // Old API: needs a <video> element
+  // Old API needs <video>
   try {
     const video = document.createElement('video');
     video.autoplay = true; video.playsInline = true; video.muted = true;
     Object.assign(video.style, { width:'100%', height:'100%', objectFit:'cover', display:'block', background:'#111' });
     container.replaceChildren(video);
 
-    // Variant A: attachVideo(video, userId)
-    try {
+    try { // attachVideo(video, userId)
       dbg?.('remote.attach.old.v1', { userId, target: 'video' });
       await maybeAwait(stream.attachVideo(video, userId));
       return video;
-    } catch (e1) {
-      dbg?.('remote.attach.old.v1.fail', { err: niceErr(e1) });
-    }
+    } catch (e1) { dbg?.('remote.attach.old.v1.fail', { err: niceErr(e1) }); }
 
-    // Variant B: attachVideo(userId, video)
+    // attachVideo(userId, video)
     dbg?.('remote.attach.old.v2', { userId, target: 'video' });
     const res = await maybeAwait(stream.attachVideo(userId, video));
     return (res && res.nodeType === 1) ? res : video;
@@ -90,7 +75,7 @@ async function attachRemoteCompat(stream, userId, container, dbg) {
     dbg?.('remote.attach.old.fail', { err: niceErr(e2) });
   }
 
-  // Last-ditch: renderVideo(canvas, ...)
+  // Last-ditch: renderVideo(canvas)
   try {
     const canvas = document.createElement('canvas');
     Object.assign(canvas.style, { width:'100%', height:'100%', display:'block', background:'#111' });
@@ -105,76 +90,20 @@ async function attachRemoteCompat(stream, userId, container, dbg) {
   }
 }
 
-/** REMOTE detach across variants. */
 async function detachRemoteCompat(stream, userId, el, dbg) {
-  try {
-    dbg?.('remote.detach.new', { userId });
-    await maybeAwait(stream.detachVideo?.(userId));
-  } catch {
-    try {
-      dbg?.('remote.detach.old', { userId, target: tag(el) });
-      await maybeAwait(stream.detachVideo?.(el, userId));
-    } catch {
-      try { await maybeAwait(stream.stopRender?.(userId)); } catch {}
-    }
-  }
+  try { dbg?.('remote.detach.new', { userId }); await maybeAwait(stream.detachVideo?.(userId)); }
+  catch { try { dbg?.('remote.detach.old', { userId, target: tag(el) }); await maybeAwait(stream.detachVideo?.(el, userId)); }
+  catch { try { await maybeAwait(stream.stopRender?.(userId)); } catch {} } }
 }
 
-/** SELF: start camera by binding directly to a <video> element. */
-async function startSelfVideo(stream, deviceId, selfVideoEl, me, dbg) {
-  // Preferred path on non-COOP/COEP Chromium & iOS
-  try {
-    dbg?.('self.startVideo.withElement', { deviceId, tag: tag(selfVideoEl) });
-    await maybeAwait(stream.startVideo({ deviceId, videoElement: selfVideoEl }));
-    return true;
-  } catch (e1) {
-    dbg?.('self.startVideo.withElement.fail', { err: niceErr(e1) });
-  }
-
-  // Fallback: plain start then try to attach (older SDKs)
-  try {
-    if (deviceId) {
-      dbg?.('self.startVideo.deviceOnly', { deviceId });
-      await maybeAwait(stream.startVideo({ deviceId }));
-    } else {
-      dbg?.('self.startVideo.plain');
-      await maybeAwait(stream.startVideo());
-    }
-  } catch (e2) {
-    dbg?.('self.startVideo.plain.fail', { err: niceErr(e2) });
-    const msg = mapCameraError(e2);
-    if (msg) throw new Error(msg);
-  }
-
-  // Older builds sometimes expose a self attach path via attachVideo; try briefly.
-  try {
-    await sleep(120);
-    dbg?.('self.attach.try', { userId: me, tag: tag(selfVideoEl) });
-    // New API often rejects self via attachVideo (Invalid element type) — ignore if it does
-    const Q = (ZoomVideo?.VideoQuality?.Video_360P) ?? 2;
-    try { await maybeAwait(stream.attachVideo(me, Q, selfVideoEl)); return true; } catch {}
-    try { await maybeAwait(stream.attachVideo(selfVideoEl, me)); return true; } catch {}
-    try { await maybeAwait(stream.attachVideo(me, selfVideoEl)); return true; } catch {}
-  } catch (e3) {
-    dbg?.('self.attach.fail', { err: niceErr(e3) });
-  }
-
-  // Last resort: let the SDK run without a bound element (you won't get self preview)
-  return true;
-}
-
+/* ---------- COMPONENT ---------- */
 export default function ZoomMeetingComponent({
-  callId,
-  locationName,
-  role = 0,
-  userId,
-  token,
+  callId, locationName, role = 0, userId, token,
 }) {
-  // ---------- Refs ----------
   const clientRef = useRef(null);
   const mediaRef  = useRef(null);
 
-  // Self MUST be a <video> here
+  // self MUST be a <video> here
   const selfVideoRef = useRef(null);
   const selfLabelRef = useRef(null);
 
@@ -182,21 +111,18 @@ export default function ZoomMeetingComponent({
   const remoteTilesRef = useRef(new Map());
   const remoteGridRef  = useRef(null);
 
-  // ---------- State ----------
   const [joining, setJoining] = useState(true);
   const [error, setError]     = useState('');
+  const [micOn, setMicOn]     = useState(false);
+  const [camOn, setCamOn]     = useState(false);
 
-  const [micOn, setMicOn] = useState(false);
-  const [camOn, setCamOn] = useState(false);
-
-  const isMobileUA =
-    typeof navigator !== 'undefined' && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+  const isMobileUA = typeof navigator !== 'undefined' && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
   const [needsGesture, setNeedsGesture] = useState(isMobileUA);
 
   const [cams, setCams] = useState([]);
   const [camId, setCamId] = useState('');
 
-  // Debug (?debug=1)
+  // Debug
   const [debug, setDebug] = useState(false);
   const [debugLines, setDebugLines] = useState([]);
   useEffect(() => {
@@ -216,7 +142,7 @@ export default function ZoomMeetingComponent({
     else console.log('[VideoSDK]', msg);
   };
 
-  // ---------- Remote tiles (container DIV) ----------
+  // ---- Remote tiles ----
   const ensureRemoteTile = (user) => {
     const uid = user.userId;
     let tile = remoteTilesRef.current.get(uid);
@@ -227,33 +153,19 @@ export default function ZoomMeetingComponent({
 
     const wrapper = document.createElement('div');
     Object.assign(wrapper.style, {
-      position: 'relative',
-      background: '#111',
-      borderRadius: '12px',
-      overflow: 'hidden',
-      minHeight: '180px',
-      boxShadow: '0 2px 10px rgba(0,0,0,.35)',
-      display: 'grid',
+      position: 'relative', background: '#111', borderRadius: '12px',
+      overflow: 'hidden', minHeight: '180px', boxShadow: '0 2px 10px rgba(0,0,0,.35)', display: 'grid',
     });
 
     const slot = document.createElement('div'); // container for SDK element/canvas/video
-    Object.assign(slot.style, {
-      width: '100%', height: '100%', display: 'block', background: '#111',
-    });
+    Object.assign(slot.style, { width: '100%', height: '100%', display: 'block', background: '#111' });
 
     const label = document.createElement('div');
     label.textContent = user.displayName || `User ${uid}`;
     Object.assign(label.style, {
-      position: 'absolute',
-      left: '10px',
-      bottom: '8px',
-      padding: '3px 8px',
-      fontSize: '12px',
-      color: '#fff',
-      background: 'rgba(0,0,0,.55)',
-      borderRadius: '6px',
-      letterSpacing: '.2px',
-      pointerEvents: 'none',
+      position: 'absolute', left: '10px', bottom: '8px',
+      padding: '3px 8px', fontSize: '12px', color: '#fff',
+      background: 'rgba(0,0,0,.55)', borderRadius: '6px', letterSpacing: '.2px', pointerEvents: 'none',
     });
 
     wrapper.appendChild(slot);
@@ -300,21 +212,17 @@ export default function ZoomMeetingComponent({
     remoteTilesRef.current.delete(uid);
   };
 
-  // ---------- Join & events ----------
+  // ---- Join & events ----
   useEffect(() => {
     if (!callId && !token) return;
     let mounted = true;
 
     (async () => {
       try {
-        setError('');
-        setJoining(true);
+        setError(''); setJoining(true);
 
         // resolve token + session
-        let sessionToken = token;
-        let sessionName;
-        let myDisplayName;
-
+        let sessionToken = token, sessionName, myDisplayName;
         if (sessionToken) {
           const p = decodeJwtPayload(sessionToken);
           sessionName   = p?.tpc;
@@ -341,8 +249,7 @@ export default function ZoomMeetingComponent({
             if (data.password) url.searchParams.set('pwd', data.password);
             url.searchParams.set('prefer', '1');
             url.searchParams.set('un', btoa(unescape(encodeURIComponent(payload.userName))));
-            window.location.replace(url.toString());
-            return;
+            window.location.replace(url.toString()); return;
           }
 
           if (!data?.token || !data?.sessionName) throw new Error('Unexpected join payload from server.');
@@ -373,10 +280,8 @@ export default function ZoomMeetingComponent({
           }
         } catch {}
 
-        // do not auto-start video/mic (mobile autoplay)
-        setMicOn(false);
-        setCamOn(false);
-        setNeedsGesture(true);
+        // Don’t auto-start (mobile autoplay)
+        setMicOn(false); setCamOn(false); setNeedsGesture(true);
 
         // hydrate remotes
         const me = client.getCurrentUserInfo()?.userId;
@@ -388,26 +293,10 @@ export default function ZoomMeetingComponent({
         });
 
         // events
-        const onAdded = (list) => {
-          asArray(list).forEach((u) => {
-            if (u.userId !== client.getCurrentUserInfo()?.userId) {
-              ensureRemoteTile(u);
-              if (u.bVideoOn) attachRemote(u.userId);
-            }
-          });
-        };
-        const onUpdated = (list) => {
-          asArray(list).forEach((u) => {
-            const tile = remoteTilesRef.current.get(u.userId);
-            if (tile?.label && u.displayName) tile.label.textContent = u.displayName;
-          });
-        };
-        const onRemoved = (list) => { asArray(list).forEach((u) => removeRemoteTile(u.userId)); };
-        const onPeerVideo = ({ action, userId }) => {
-          dbg('peer-video-state-change', { action, userId });
-          if (action === 'Start') attachRemote(userId, 0);
-          else detachRemote(userId);
-        };
+        const onAdded   = (list) => asArray(list).forEach((u) => { if (u.userId !== client.getCurrentUserInfo()?.userId) { ensureRemoteTile(u); if (u.bVideoOn) attachRemote(u.userId); }});
+        const onUpdated = (list) => asArray(list).forEach((u) => { const t = remoteTilesRef.current.get(u.userId); if (t?.label && u.displayName) t.label.textContent = u.displayName; });
+        const onRemoved = (list) => asArray(list).forEach((u) => removeRemoteTile(u.userId));
+        const onPeerVideo = ({ action, userId }) => { dbg('peer-video-state-change', { action, userId }); if (action === 'Start') attachRemote(userId, 0); else detachRemote(userId); };
 
         client.on('user-added', onAdded);
         client.on('user-updated', onUpdated);
@@ -420,10 +309,7 @@ export default function ZoomMeetingComponent({
       } catch (e) {
         console.group('[VideoSDK][join] failed');
         console.error('raw error:', e);
-        if (e?.response) {
-          console.error('HTTP status:', e.response.status);
-          console.error('HTTP data:', e.response.data);
-        }
+        if (e?.response) { console.error('HTTP status:', e.response.status); console.error('HTTP data:', e.response.data); }
         console.groupEnd?.();
 
         if (!mounted) return;
@@ -453,13 +339,7 @@ export default function ZoomMeetingComponent({
         remoteTilesRef.current.clear();
       } catch {}
 
-      try {
-        const me = client?.getCurrentUserInfo()?.userId;
-        if (me != null) {
-          try { await maybeAwait(media?.stopVideo()); } catch {}
-        }
-      } catch {}
-
+      try { maybeAwait(media?.stopVideo()); } catch {}
       try { maybeAwait(media?.stopAudio()); } catch {}
       try { client?.leave(); } catch {}
 
@@ -468,234 +348,122 @@ export default function ZoomMeetingComponent({
     };
   }, [callId, locationName, role, userId, token]);
 
-  // camera switching while on
-  useEffect(() => {
-    (async () => {
-      const media = mediaRef.current;
-      if (!media || !camOn || !camId) return;
-      try {
-        if (media.switchCamera) {
-          await maybeAwait(media.switchCamera(camId));
-          dbg('switchCamera.ok', { camId });
-        } else {
-          await maybeAwait(media.stopVideo());
-          const me = clientRef.current?.getCurrentUserInfo()?.userId;
-          await startSelfVideo(media, camId, selfVideoRef.current, me, dbg);
-        }
-      } catch (e) {
-        dbg('switchCamera.fail', { err: niceErr(e) });
-      }
-    })();
-  }, [camId, camOn]);
-
-  // ---------- Controls ----------
-  const toggleMic = async () => {
-    const media = mediaRef.current;
-    if (!media) return;
-    try {
-      if (micOn) { await maybeAwait(media.stopAudio()); setMicOn(false); }
-      else      { await maybeAwait(media.startAudio()); setMicOn(true); }
-    } catch (e) {
-      setError('Microphone error: ' + (e?.reason || e?.message || 'unknown'));
-    }
-  };
-
+  // ---- Camera start/stop/switch (SELF) ----
   const startCam = async () => {
     setError('');
     const media = mediaRef.current;
     const client = clientRef.current;
     if (!media || !client) return;
 
-    // Pre-warm permission with chosen device for clearer errors
+    // Pre-warm permission with the chosen device for better error messages
     try {
       const constraints = camId ? { video: { deviceId: { exact: camId } } } : { video: true };
       const tmp = await navigator.mediaDevices.getUserMedia(constraints);
       tmp.getTracks().forEach((t) => t.stop());
-    } catch (e) {
-      setError(mapCameraError(e));
-      return;
-    }
+    } catch (e) { setError(mapCameraError(e)); return; }
 
+    // Start video by binding directly to the <video> element
     try {
-      const me = client.getCurrentUserInfo()?.userId;
-      await startSelfVideo(media, camId, selfVideoRef.current, me, dbg);
+      const el = selfVideoRef.current;
+      dbg('self.startVideo.withElement', { deviceId: camId || '(default)', tag: tag(el) });
+      await maybeAwait(media.startVideo({ deviceId: camId || undefined, videoElement: el }));
       setCamOn(true);
       setNeedsGesture(false);
-    } catch (e) {
-      setError(e?.message || mapCameraError(e) || 'Could not start camera');
+      return;
+    } catch (e1) {
+      // Fallback path (older SDKs)
+      console.warn('[ZMC] self.startVideo.withElement FAIL -> fallback', e1);
+      try {
+        if (camId) await maybeAwait(media.startVideo({ deviceId: camId }));
+        else       await maybeAwait(media.startVideo());
+        await sleep(120);
+        const me = client.getCurrentUserInfo()?.userId;
+        try { const Q = (ZoomVideo?.VideoQuality?.Video_360P) ?? 2; await maybeAwait(media.attachVideo(me, Q, selfVideoRef.current)); } catch {}
+      } catch (e2) {
+        setError(mapCameraError(e2) || 'Could not start camera');
+        return;
+      }
+      setCamOn(true);
+      setNeedsGesture(false);
     }
   };
 
-  const stopCam = async () => {
-    try { await maybeAwait(mediaRef.current?.stopVideo()); } catch {}
-    setCamOn(false);
-  };
+  const stopCam = async () => { try { await maybeAwait(mediaRef.current?.stopVideo()); } catch {} setCamOn(false); };
+
+  useEffect(() => {
+    (async () => {
+      const media = mediaRef.current;
+      if (!media || !camOn || !camId) return;
+      try {
+        if (media.switchCamera) { await maybeAwait(media.switchCamera(camId)); dbg('switchCamera.ok', { camId }); }
+        else { await maybeAwait(media.stopVideo()); await startCam(); }
+      } catch (e) { console.warn('[ZMC] switchCamera FAIL', e); }
+    })();
+  }, [camId, camOn]);
 
   const toggleCam = async () => (camOn ? stopCam() : startCam());
 
-  const handleEnable = async () => {
-    await startCam();       // start camera first to satisfy autoplay
-    await toggleMic();      // then mic
+  // ---- Mic ----
+  const toggleMic = async () => {
+    const media = mediaRef.current;
+    if (!media) return;
+    try { if (micOn) { await maybeAwait(media.stopAudio()); setMicOn(false); }
+          else       { await maybeAwait(media.startAudio()); setMicOn(true); } }
+    catch (e) { setError('Microphone error: ' + (e?.reason || e?.message || 'unknown')); }
   };
 
-  // ---------- UI ----------
+  const handleEnable = async () => { await startCam(); await toggleMic(); };
+
+  // ---- UI ----
   return (
-    <div style={{
-      width: '100%', height: '100%',
-      display: 'grid', gridTemplateRows: 'auto 1fr',
-      background: '#000', color: '#fff'
-    }}>
-      {/* Top bar */}
-      <div style={{
-        padding: 12, display: 'flex', alignItems: 'center', gap: 10,
-        background: 'rgba(255,255,255,.06)', borderBottom: '1px solid rgba(255,255,255,.07)'
-      }}>
-        <strong style={{ letterSpacing: '.2px' }}>
-          {locationName ? `Clinic – ${locationName}` : 'Clinic'}
-        </strong>
+    <div style={{ width: '100%', height: '100%', display: 'grid', gridTemplateRows: 'auto 1fr', background: '#000', color: '#fff' }}>
+      <div style={{ padding: 12, display: 'flex', alignItems: 'center', gap: 10, background: 'rgba(255,255,255,.06)', borderBottom: '1px solid rgba(255,255,255,.07)' }}>
+        <strong style={{ letterSpacing: '.2px' }}>{locationName ? `Clinic – ${locationName}` : 'Clinic'}</strong>
 
         {cams.length > 1 && (
-          <select
-            value={camId}
-            onChange={(e) => setCamId(e.target.value)}
-            style={{ marginLeft: 12, background: '#111', color: '#fff', borderRadius: 6, border: '1px solid #333', padding: '4px 8px' }}
-            title="Camera"
-          >
-            {cams.map((c) => (
-              <option key={c.deviceId} value={c.deviceId}>{c.label || 'Camera'}</option>
-            ))}
+          <select value={camId} onChange={(e) => setCamId(e.target.value)} style={{ marginLeft: 12, background: '#111', color: '#fff', borderRadius: 6, border: '1px solid #333', padding: '4px 8px' }} title="Camera">
+            {cams.map((c) => (<option key={c.deviceId} value={c.deviceId}>{c.label || 'Camera'}</option>))}
           </select>
         )}
 
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
-          <button
-            onClick={toggleMic}
-            style={{
-              padding: '6px 12px', borderRadius: 8, border: 0,
-              background: micOn ? '#2e8b57' : '#666', color: '#fff'
-            }}
-          >
-            {micOn ? 'Mic On' : 'Mic Off'}
-          </button>
-          <button
-            onClick={toggleCam}
-            style={{
-              padding: '6px 12px', borderRadius: 8, border: 0,
-              background: camOn ? '#2e8b57' : '#666', color: '#fff'
-            }}
-          >
-            {camOn ? 'Cam On' : 'Cam Off'}
-          </button>
-          <button
-            onClick={() => {
-              try { maybeAwait(mediaRef.current?.stopVideo()); } catch {}
-              try { maybeAwait(mediaRef.current?.stopAudio()); } catch {}
-              try { clientRef.current?.leave(); } catch {}
-            }}
-            style={{ padding: '6px 12px', borderRadius: 8, background: '#d33', color: '#fff', border: 0 }}
-          >
-            Leave
-          </button>
+          <button onClick={toggleMic} style={{ padding: '6px 12px', borderRadius: 8, border: 0, background: micOn ? '#2e8b57' : '#666', color: '#fff' }}>{micOn ? 'Mic On' : 'Mic Off'}</button>
+          <button onClick={toggleCam} style={{ padding: '6px 12px', borderRadius: 8, border: 0, background: camOn ? '#2e8b57' : '#666', color: '#fff' }}>{camOn ? 'Cam On' : 'Cam Off'}</button>
+          <button onClick={() => { try { maybeAwait(mediaRef.current?.stopVideo()); } catch {} try { maybeAwait(mediaRef.current?.stopAudio()); } catch {} try { clientRef.current?.leave(); } catch {} }}
+                  style={{ padding: '6px 12px', borderRadius: 8, background: '#d33', color: '#fff', border: 0 }}>Leave</button>
         </div>
       </div>
 
-      {/* Stage */}
-      <div style={{
-        display: 'grid',
-        gridTemplateColumns: 'minmax(280px,360px) 1fr',
-        gap: 14, padding: 14
-      }}>
-        {/* Local tile (SELF uses <video>) */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(280px,360px) 1fr', gap: 14, padding: 14 }}>
+        {/* Self (VIDEO element) */}
         <div style={{ position: 'relative' }}>
           <div style={{ color: '#bbb', marginBottom: 6, fontSize: 14 }}>You</div>
-          <div style={{
-            position: 'relative', width: '100%', height: 220,
-            background: '#111', borderRadius: 12, overflow: 'hidden',
-            boxShadow: '0 2px 10px rgba(0,0,0,.35)'
-          }}>
-            <video
-              ref={selfVideoRef}
-              autoPlay
-              muted
-              playsInline
-              style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
-            />
-            <div
-              ref={selfLabelRef}
-              style={{
-                position: 'absolute', left: 10, bottom: 8,
-                padding: '3px 8px', fontSize: 12,
-                background: 'rgba(0,0,0,.55)', borderRadius: 6, letterSpacing: '.2px'
-              }}
-            >
-              You
-            </div>
+          <div style={{ position: 'relative', width: '100%', height: 220, background: '#111', borderRadius: 12, overflow: 'hidden', boxShadow: '0 2px 10px rgba(0,0,0,.35)' }}>
+            <video ref={selfVideoRef} autoPlay muted playsInline style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
+            <div ref={selfLabelRef} style={{ position: 'absolute', left: 10, bottom: 8, padding: '3px 8px', fontSize: 12, background: 'rgba(0,0,0,.55)', borderRadius: 6, letterSpacing: '.2px' }}>You</div>
           </div>
         </div>
 
         {/* Remotes (container DIV) */}
         <div>
           <div style={{ color: '#bbb', marginBottom: 6, fontSize: 14 }}>Participants</div>
-          <div
-            ref={remoteGridRef}
-            id="remote-grid"
-            style={{
-              width: '100%',
-              minHeight: 220,
-              display: 'grid',
-              gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
-              gap: 12
-            }}
-          />
+          <div ref={remoteGridRef} id="remote-grid" style={{ width: '100%', minHeight: 220, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12 }} />
         </div>
       </div>
 
-      {/* Connecting overlay */}
-      {joining && (
-        <div style={{
-          position: 'absolute', inset: 0, display: 'grid', placeItems: 'center',
-          background: 'rgba(0,0,0,.35)', fontSize: 16
-        }}>
-          Connecting to session…
-        </div>
-      )}
+      {joining && (<div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,.35)', fontSize: 16 }}>Connecting to session…</div>)}
 
-      {/* Gesture / error overlay */}
       {(needsGesture || !!error) && (
-        <div style={{
-          position: 'absolute', inset: 0, display: 'grid', placeItems: 'center',
-          background: 'rgba(0,0,0,.45)'
-        }}>
+        <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,.45)' }}>
           <div style={{ display: 'grid', gap: 10, placeItems: 'center' }}>
-            {!!error && (
-              <div style={{
-                background: 'rgba(220,0,0,.85)', padding: '8px 12px',
-                borderRadius: 6, maxWidth: 520, lineHeight: 1.35
-              }}>
-                {String(error)}
-              </div>
-            )}
-            <button
-              onClick={handleEnable}
-              style={{
-                padding: '10px 14px', borderRadius: 8, border: 0,
-                background: '#1f8fff', color: '#fff', fontWeight: 600
-              }}
-            >
-              Enable mic & cam
-            </button>
+            {!!error && (<div style={{ background: 'rgba(220,0,0,.85)', padding: '8px 12px', borderRadius: 6, maxWidth: 520, lineHeight: 1.35 }}>{String(error)}</div>)}
+            <button onClick={handleEnable} style={{ padding: '10px 14px', borderRadius: 8, border: 0, background: '#1f8fff', color: '#fff', fontWeight: 600 }}>Enable mic & cam</button>
           </div>
         </div>
       )}
 
-      {/* Debug overlay */}
       {debug && (
-        <div style={{
-          position: 'absolute', right: 8, bottom: 8, width: 360, maxHeight: 260, overflow: 'auto',
-          fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 11,
-          background: 'rgba(0,0,0,.55)', border: '1px solid rgba(255,255,255,.12)',
-          borderRadius: 6, padding: 8, whiteSpace: 'pre-wrap'
-        }}>
+        <div style={{ position: 'absolute', right: 8, bottom: 8, width: 360, maxHeight: 260, overflow: 'auto', fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 11, background: 'rgba(0,0,0,.55)', border: '1px solid rgba(255,255,255,.12)', borderRadius: 6, padding: 8, whiteSpace: 'pre-wrap' }}>
           {debugLines.join('\n')}
         </div>
       )}
