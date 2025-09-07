@@ -4,7 +4,7 @@ import axios from 'axios';
 import ZoomVideo from '@zoom/videosdk';
 
 const API_BASE = '/api';
-const BUILD = 'ZMC-v6.1-mobile-canvas-fix-2025-09-07';
+const BUILD = 'ZMC-v6.2-remote-canvas-fallback-2025-09-07';
 
 const asArray = (x) => (Array.isArray(x) ? x : x ? [x] : []);
 const displayNameFor = (role, location) =>
@@ -29,7 +29,10 @@ function decodeJwtPayload(token) {
 async function maybeAwait(v) { if (v && typeof v.then === 'function') return await v; return v; }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const tag = (el) => (el && el.tagName ? el.tagName.toLowerCase() : String(el));
-const niceErr = (e) => typeof e === 'string' ? e : JSON.stringify({ name: e?.name, message: e?.message, reason: e?.reason, code: e?.code });
+const niceErr = (e) =>
+  typeof e === 'string'
+    ? e
+    : JSON.stringify({ name: e?.name, message: e?.message, reason: e?.reason, code: e?.code });
 
 function mapCameraError(e) {
   const s = (e?.name || e?.message || e?.reason || '').toLowerCase();
@@ -60,19 +63,18 @@ function hookVideoDebug(el, label, dbg) {
 }
 
 /* ---------- REMOTES: attach helpers ---------- */
-function sizeOf(el) {
+const sizeOf = (el) => {
   const r = el.getBoundingClientRect?.();
   const w = Math.max(1, Math.round(r?.width || 640));
   const h = Math.max(1, Math.round(r?.height || 360));
   return { w, h };
-}
+};
 
 /**
  * Attach remote video.
- * - On mobile or when ?forceCanvas=1 we prefer a <canvas> via renderVideo (more robust in emulators).
- * - Otherwise try attachVideo first (may return a <video-player>), then fall back to canvas.
+ * - Canvas path is the most reliable on Android/emulators, so we offer a forced/fallback route.
  */
-async function attachRemoteCompat(stream, userId, container, dbg, preferCanvas) {
+async function attachRemoteCompat(stream, userId, container, dbg, useCanvas) {
   const Q = (ZoomVideo?.VideoQuality?.Video_360P) ?? 2;
 
   const attachViaCanvas = async () => {
@@ -102,21 +104,18 @@ async function attachRemoteCompat(stream, userId, container, dbg, preferCanvas) 
     return canvas;
   };
 
-  if (preferCanvas) {
-    try {
-      dbg('remote.attach.mode', { userId, mode: 'canvas-preferred' });
-      return await attachViaCanvas();
-    } catch (e) {
-      dbg('remote.canvas.preferred.fail', { userId, err: niceErr(e) });
-    }
-  }
+  if (useCanvas) return await attachViaCanvas();
 
   // Try new API first: attachVideo(userId, quality, container)
   try {
     dbg('remote.attach.new', { userId, target: tag(container) });
     const maybeEl = await maybeAwait(stream.attachVideo(userId, Q, container));
     const el = (maybeEl && maybeEl.nodeType === 1) ? maybeEl : container;
-    if (el !== container && container?.parentNode) container.parentNode.replaceChild(el, container);
+
+    // Make sure custom element fills the tile
+    if (el && el !== container && container?.parentNode) container.parentNode.replaceChild(el, container);
+    if (el && el !== container) Object.assign(el.style, { width:'100%', height:'100%', display:'block' });
+
     return el;
   } catch (e) {
     dbg('remote.attach.new.fail', { userId, err: niceErr(e) });
@@ -175,11 +174,10 @@ export default function ZoomMeetingComponent({
   const [micOn, setMicOn]     = useState(false);
   const [camOn, setCamOn]     = useState(false);
 
-  const isMobileUA =
-    typeof navigator !== 'undefined' && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
-  const forceCanvasParam =
-    typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('forceCanvas');
-  const preferCanvas = isMobileUA || forceCanvasParam;
+  const isMobileUA = typeof navigator !== 'undefined' && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+  const forceCanvasParam = typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('forceCanvas');
+  // **Key**: prefer canvas for remotes if mobile OR ?forceCanvas=1
+  const preferCanvasForRemotes = isMobileUA || forceCanvasParam;
 
   const [needsGesture, setNeedsGesture] = useState(isMobileUA);
 
@@ -269,17 +267,35 @@ export default function ZoomMeetingComponent({
         return;
       }
 
-      // ✅ Use the component-level preferCanvas (mobile OR ?forceCanvas=1)
-      const el = await attachRemoteCompat(media, uid, tile.slot, dbg, preferCanvas);
+      // First try (may return video-player)
+      const el = await attachRemoteCompat(media, uid, tile.slot, dbg, preferCanvasForRemotes);
       tile.actual = el;
       dbg('remote.attach.ok', { uid, attempt, actual: tag(el) });
 
-      if (tag(el) !== 'canvas') hookVideoDebug(el, `remote-${uid}`, dbg);
+      // If SDK gave us a video-player (common on desktop), a few builds still paint black.
+      // In that case, detach + force canvas.
+      if (!preferCanvasForRemotes && tag(el) !== 'canvas') {
+        // schedule a quick fallback if we still see nothing
+        setTimeout(async () => {
+          try {
+            // We can't inspect video-player's inner <video> if shadow DOM is closed,
+            // so just switch to canvas to be safe.
+            dbg('remote.attach.fallback-canvas', { uid, from: tag(el) });
+            await detachRemoteCompat(media, uid, el, dbg);
+            const cv = await attachRemoteCompat(media, uid, tile.slot, dbg, true);
+            tile.actual = cv;
+          } catch (e) {
+            dbg('remote.attach.fallback-canvas.fail', { uid, err: niceErr(e) });
+          }
+        }, 600);
+      }
+
+      if (tag(tile.actual) !== 'canvas') hookVideoDebug(tile.actual, `remote-${uid}`, dbg);
       else {
         // poll size a few times so we at least see canvas sizing
         const id = `remote-${uid}-${Math.random().toString(36).slice(2,6)}`;
         let n = 0; const t = setInterval(() => {
-          n++; const r = el.getBoundingClientRect?.(); dbg('canvas.remote.size', { id, w: Math.round(r?.width||0), h: Math.round(r?.height||0) });
+          n++; const r = tile.actual.getBoundingClientRect?.(); dbg('canvas.remote.size', { id, w: Math.round(r?.width||0), h: Math.round(r?.height||0) });
           if (n>=10) clearInterval(t);
         }, 1000);
       }
