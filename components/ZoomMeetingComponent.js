@@ -4,7 +4,7 @@ import axios from 'axios';
 import ZoomVideo from '@zoom/videosdk';
 
 const API_BASE = '/api';
-const BUILD = 'ZMC-selfVideoElement-2025-09-07b';
+const BUILD = 'ZMC-v3-2025-09-07r'; // <- check this appears in console
 
 const asArray = (x) => (Array.isArray(x) ? x : x ? [x] : []);
 const displayNameFor = (role, location) =>
@@ -362,29 +362,17 @@ export default function ZoomMeetingComponent({
       tmp.getTracks().forEach((t) => t.stop());
     } catch (e) { setError(mapCameraError(e)); return; }
 
-    // Start video by binding directly to the <video> element
+    // Start video by binding directly to the <video> element (this is the key fix)
+    const el = selfVideoRef.current;
     try {
-      const el = selfVideoRef.current;
       dbg('self.startVideo.withElement', { deviceId: camId || '(default)', tag: tag(el) });
       await maybeAwait(media.startVideo({ deviceId: camId || undefined, videoElement: el }));
+      dbg('self.startVideo.withElement.ok');
       setCamOn(true);
       setNeedsGesture(false);
-      return;
     } catch (e1) {
-      // Fallback path (older SDKs)
-      console.warn('[ZMC] self.startVideo.withElement FAIL -> fallback', e1);
-      try {
-        if (camId) await maybeAwait(media.startVideo({ deviceId: camId }));
-        else       await maybeAwait(media.startVideo());
-        await sleep(120);
-        const me = client.getCurrentUserInfo()?.userId;
-        try { const Q = (ZoomVideo?.VideoQuality?.Video_360P) ?? 2; await maybeAwait(media.attachVideo(me, Q, selfVideoRef.current)); } catch {}
-      } catch (e2) {
-        setError(mapCameraError(e2) || 'Could not start camera');
-        return;
-      }
-      setCamOn(true);
-      setNeedsGesture(false);
+      dbg('self.startVideo.withElement.fail', { err: niceErr(e1) });
+      setError(mapCameraError(e1) || 'Could not start camera');
     }
   };
 
