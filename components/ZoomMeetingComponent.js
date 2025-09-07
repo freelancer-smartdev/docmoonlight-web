@@ -325,6 +325,7 @@ export default function ZoomMeetingComponent({
     try {
       const me = client.getCurrentUserInfo()?.userId;
       if (selfVideoRef.current && me != null) {
+        console.log('selfVideoRef.current', selfVideoRef.current);
         const el = await attachIntoVideo(media, me, selfVideoRef.current, dbg);
         if (el && el !== selfVideoRef.current) selfVideoRef.current = el;
       }
