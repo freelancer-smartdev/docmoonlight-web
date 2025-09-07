@@ -172,6 +172,9 @@ export default function ZoomMeetingComponent({
   const [camOn, setCamOn]     = useState(false);
 
   const isMobileUA = typeof navigator !== 'undefined' && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+  const forceCanvasParam = typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('forceCanvas');
+  const preferCanvas = isMobileUA || forceCanvasParam;
+
   const [needsGesture, setNeedsGesture] = useState(isMobileUA);
 
   const [cams, setCams] = useState([]);
