@@ -4,13 +4,12 @@ import axios from 'axios';
 import ZoomVideo from '@zoom/videosdk';
 
 const API_BASE = '/api';
-const BUILD = 'ZMC-v6.7-remote-video-fill-2025-09-07';
+const BUILD = 'ZMC-v6.6-android-remote-container-2025-09-07';
 
 const asArray = (x) => (Array.isArray(x) ? x : x ? [x] : []);
 const displayNameFor = (role, location) =>
   Number(role) === 1 ? `Doctor – ${location || ''}` : `Clinic – ${location || ''}`;
 
-/* ---------- utils ---------- */
 function decodeJwtPayload(token) {
   try {
     const part = token.split('.')[1];
@@ -26,13 +25,14 @@ function decodeJwtPayload(token) {
     return null;
   }
 }
-async function maybeAwait(v) { return (v && typeof v.then === 'function') ? await v : v; }
+
+async function maybeAwait(v) { if (v && typeof v.then === 'function') return await v; return v; }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const tag = (el) => (el && el.tagName ? el.tagName.toLowerCase() : String(el));
 const niceErr = (e) =>
-  typeof e === 'string'
-    ? e
-    : JSON.stringify({ name: e?.name, message: e?.message, reason: e?.reason, code: e?.code });
+  typeof e === 'string' ? e : JSON.stringify({
+    name: e?.name, message: e?.message, reason: e?.reason, code: e?.code
+  });
 
 function mapCameraError(e) {
   const s = (e?.name || e?.message || e?.reason || '').toLowerCase();
@@ -43,14 +43,14 @@ function mapCameraError(e) {
   return 'Could not start camera';
 }
 
-/* ---------- tiny helpers to introspect video ---------- */
+/* ---------- tiny helpers to introspect video/canvas ---------- */
 function findInnerVideo(root) {
   if (!root) return null;
   if (root.tagName?.toLowerCase() === 'video') return root;
   let v = root.querySelector?.('video') || null;
   if (v) return v;
   if (root.shadowRoot) v = root.shadowRoot.querySelector?.('video') || null;
-  return v || null;
+  return v || null; // closed shadow DOM will return null (e.g. <video-player/>)
 }
 function hookVideoDebug(el, label, dbg) {
   const v = findInnerVideo(el);
@@ -61,119 +61,96 @@ function hookVideoDebug(el, label, dbg) {
     .forEach((e) => v.addEventListener(e, log));
   let n = 0; const t = setInterval(() => {
     n++; dbg(`video.${label}.size`, { id, vw: v.videoWidth, vh: v.videoHeight });
-    if (n >= 10) clearInterval(t);
+    if (n>=10) clearInterval(t);
   }, 1000);
 }
 
+/* ---------- REMOTES: attach helpers ---------- */
 function sizeOf(el) {
-  const r = el?.getBoundingClientRect?.();
-  return { w: Math.max(1, Math.round(r?.width || 640)), h: Math.max(1, Math.round(r?.height || 360)) };
-}
-
-/* ---------- remote attach helpers ---------- */
-function makeVideoEl() {
-  const v = document.createElement('video');
-  v.autoplay = true;
-  v.playsInline = true;
-  v.muted = true; // SDK mixes audio separately
-  Object.assign(v.style, {
-    width: '100%',
-    height: '100%',
-    objectFit: 'cover',
-    display: 'block',
-    background: '#111',
-  });
-  return v;
-}
-function forceFill(el) {
-  try {
-    Object.assign(el.style, {
-      position: 'absolute',
-      inset: '0',
-      width: '100%',
-      height: '100%',
-      display: 'block',
-      background: '#111',
-    });
-  } catch {}
-  return el;
-}
-function placeInSlot(slotDiv, el, dbg, uid) {
-  try {
-    // Ensure slot is a positioned parent so the child can absolutely fill it.
-    if (getComputedStyle(slotDiv).position === 'static') slotDiv.style.position = 'relative';
-    slotDiv.replaceChildren(el);
-    // one more nudge in case the element has internal style rules
-    forceFill(el);
-    const r = el.getBoundingClientRect?.();
-    dbg('remote.place.appended', { uid, el: tag(el), w: Math.round(r?.width||0), h: Math.round(r?.height||0) });
-  } catch (err) {
-    dbg('remote.place.fail', { uid, err: String(err) });
-  }
+  const r = el.getBoundingClientRect?.();
+  const w = Math.max(1, Math.round(r?.width || 640));
+  const h = Math.max(1, Math.round(r?.height || 360));
+  return { w, h };
 }
 
 /**
- * Attach remote video via attachVideo. Canvas fallback is skipped by default
- * (recent SDK builds tell us to "Use the attachVideo method").
+ * Attach remote video correctly on Android/Chrome:
+ *  - pass a CONTAINER DIV
+ *  - keep that div, and style the returned <video-player> to fill it
  */
-async function attachRemoteCompat(stream, userId, slotDiv, dbg) {
+async function attachRemoteCompat(stream, userId, container, dbg) {
   const Q = (ZoomVideo?.VideoQuality?.Video_360P) ?? 2;
 
-  // New API with our own <video>
+  // container must exist and be visible
+  Object.assign(container.style, {
+    width: '100%', height: '100%', display: 'block', background: '#111', position: 'relative'
+  });
+  container.replaceChildren();
+
   try {
-    const vid = makeVideoEl();
-    // Prepare the slot
-    slotDiv.style.position = 'relative';
-    slotDiv.replaceChildren(vid);
+    dbg('remote.attach.new', { userId, target: tag(container) });
+    const maybeEl = await maybeAwait(stream.attachVideo(userId, Q, container));
+    // SDK may return the created player OR append it silently
+    let player = (maybeEl && maybeEl.nodeType === 1) ? maybeEl : container.firstElementChild;
+    if (!player) player = container; // safety
 
-    dbg('remote.attach.new', { userId, target: 'video' });
-    const maybeEl = await maybeAwait(stream.attachVideo(userId, Q, vid));
-    const actual = (maybeEl && maybeEl.nodeType === 1) ? maybeEl : vid;
+    // Ensure the player fills the slot
+    try {
+      Object.assign(player.style, { width: '100%', height: '100%', display: 'block', background: '#111' });
+    } catch {}
 
-    // Put the (possibly returned) element inside the slot and force-fill it
-    placeInSlot(slotDiv, forceFill(actual), dbg, userId);
-    return actual;
+    const rect = (player.getBoundingClientRect?.()) || {};
+    dbg('remote.tile.bounds', { uid: userId, tag: tag(player), w: Math.round(rect.width||0), h: Math.round(rect.height||0) });
+
+    // Debug media element if we can see inside
+    if (tag(player) !== 'canvas') hookVideoDebug(player, `remote-${userId}`, dbg);
+
+    // ResizeObserver to verify sizing later (Android often lays out after next frame)
+    if ('ResizeObserver' in window) {
+      const ro = new ResizeObserver(() => {
+        const r = player.getBoundingClientRect?.() || {};
+        dbg('remote.player.resize', { uid: userId, w: Math.round(r.width||0), h: Math.round(r.height||0) });
+      });
+      ro.observe(player);
+      player._ro = ro;
+    }
+
+    return player;
   } catch (e) {
     dbg('remote.attach.new.fail', { userId, err: niceErr(e) });
   }
 
-  // Old: attachVideo(video, userId)
+  // Legacy fallback (older SDK signatures)
   try {
-    const vid = makeVideoEl();
-    slotDiv.style.position = 'relative';
-    slotDiv.replaceChildren(vid);
+    const video = document.createElement('video');
+    video.autoplay = true; video.playsInline = true; video.muted = true;
+    Object.assign(video.style, { width:'100%', height:'100%', objectFit:'cover', display:'block', background:'#111' });
+    container.replaceChildren(video);
 
-    dbg('remote.attach.old.v1', { userId, target: 'video' });
-    await maybeAwait(stream.attachVideo(vid, userId));
-    placeInSlot(slotDiv, forceFill(vid), dbg, userId);
-    return vid;
-  } catch (e1) {
-    dbg('remote.attach.old.v1.fail', { userId, err: niceErr(e1) });
-  }
-
-  // Old alt: attachVideo(userId, video)
-  try {
-    const vid = makeVideoEl();
-    slotDiv.style.position = 'relative';
-    slotDiv.replaceChildren(vid);
+    try {
+      dbg('remote.attach.old.v1', { userId, target: 'video' });
+      await maybeAwait(stream.attachVideo(video, userId));
+      hookVideoDebug(video, `remote-${userId}`, dbg);
+      return video;
+    } catch (e1) { dbg('remote.attach.old.v1.fail', { userId, err: niceErr(e1) }); }
 
     dbg('remote.attach.old.v2', { userId, target: 'video' });
-    const maybeEl = await maybeAwait(stream.attachVideo(userId, vid));
-    const actual = (maybeEl && maybeEl.nodeType === 1) ? maybeEl : vid;
-    placeInSlot(slotDiv, forceFill(actual), dbg, userId);
-    return actual;
+    const res = await maybeAwait(stream.attachVideo(userId, video));
+    const el = (res && res.nodeType === 1) ? res : video;
+    hookVideoDebug(el, `remote-${userId}`, dbg);
+    return el;
   } catch (e2) {
-    dbg('remote.attach.old.v2.fail', { userId, err: niceErr(e2) });
-    throw e2;
+    dbg('remote.attach.old.fail', { userId, err: niceErr(e2) });
   }
+
+  throw new Error('Could not attach remote video');
 }
 
 async function detachRemoteCompat(stream, userId, el, dbg) {
   try { dbg('remote.detach.new', { userId }); await maybeAwait(stream.detachVideo?.(userId)); }
-  catch {
-    try { dbg('remote.detach.old', { userId, target: tag(el) }); await maybeAwait(stream.detachVideo?.(el, userId)); }
-    catch { try { await maybeAwait(stream.stopRender?.(userId)); } catch {} }
-  }
+  catch { try { dbg('remote.detach.old', { userId, target: tag(el) }); await maybeAwait(stream.detachVideo?.(el, userId)); }
+  catch { try { await maybeAwait(stream.stopRender?.(userId)); } catch {} } }
+  if (el && el._ro && el._ro.disconnect) try { el._ro.disconnect(); } catch {}
 }
 
 /* ---------- COMPONENT ---------- */
@@ -183,7 +160,7 @@ export default function ZoomMeetingComponent({
   const clientRef = useRef(null);
   const mediaRef  = useRef(null);
 
-  // self is a <video>
+  // self MUST be a <video> here
   const selfVideoRef = useRef(null);
   const selfLabelRef = useRef(null);
 
@@ -217,12 +194,12 @@ export default function ZoomMeetingComponent({
   }, []);
   const dbg = (msg, data) => {
     const line = `[VideoSDK] ${msg} ${data ? JSON.stringify(data) : ''}`;
-    setDebugLines((p) => (debug ? p.concat(line).slice(-900) : p));
+    setDebugLines((p) => (debug ? p.concat(line).slice(-800) : p));
     if (data !== undefined) console.log('[VideoSDK]', msg, data);
     else console.log('[VideoSDK]', msg);
   };
 
-  /* ---- Remote tiles ---- */
+  // ---- Remote tiles ----
   const ensureRemoteTile = (user) => {
     const uid = user.userId;
     let tile = remoteTilesRef.current.get(uid);
@@ -233,37 +210,19 @@ export default function ZoomMeetingComponent({
 
     const wrapper = document.createElement('div');
     Object.assign(wrapper.style, {
-      position: 'relative',
-      background: '#111',
-      borderRadius: '12px',
-      overflow: 'hidden',
-      minHeight: '180px',
-      boxShadow: '0 2px 10px rgba(0,0,0,.35)',
-      display: 'grid',
+      position: 'relative', background: '#111', borderRadius: '12px',
+      overflow: 'hidden', minHeight: '180px', boxShadow: '0 2px 10px rgba(0,0,0,.35)', display: 'grid',
     });
 
-    const slot = document.createElement('div'); // host for <video>/<video-player>
-    Object.assign(slot.style, {
-      width: '100%',
-      height: '100%',
-      display: 'block',
-      background: '#111',
-      position: 'relative', // needed for child absolute fill
-    });
+    const slot = document.createElement('div'); // container for SDK element
+    Object.assign(slot.style, { width: '100%', height: '100%', display: 'block', background: '#111' });
 
     const label = document.createElement('div');
     label.textContent = user.displayName || `User ${uid}`;
     Object.assign(label.style, {
-      position: 'absolute',
-      left: '10px',
-      bottom: '8px',
-      padding: '3px 8px',
-      fontSize: '12px',
-      color: '#fff',
-      background: 'rgba(0,0,0,.55)',
-      borderRadius: '6px',
-      letterSpacing: '.2px',
-      pointerEvents: 'none',
+      position: 'absolute', left: '10px', bottom: '8px',
+      padding: '3px 8px', fontSize: '12px', color: '#fff',
+      background: 'rgba(0,0,0,.55)', borderRadius: '6px', letterSpacing: '.2px', pointerEvents: 'none',
     });
 
     wrapper.appendChild(slot);
@@ -285,25 +244,11 @@ export default function ZoomMeetingComponent({
     } catch {}
   };
 
-  const measureTile = (uid, tile, element, stage) => {
-    try {
-      const rw = tile.wrapper.getBoundingClientRect?.();
-      const rs = tile.slot.getBoundingClientRect?.();
-      const re = element.getBoundingClientRect?.();
-      dbg(`remote.tile.bounds.${stage}`, {
-        uid,
-        wrapper: { w: Math.round(rw?.width||0), h: Math.round(rw?.height||0) },
-        slot:    { w: Math.round(rs?.width||0), h: Math.round(rs?.height||0) },
-        el:      { tag: tag(element), w: Math.round(re?.width||0), h: Math.round(re?.height||0) },
-      });
-    } catch {}
-  };
-
   const attachRemote = async (uid, attempt = 0) => {
     try {
       const client = clientRef.current;
-      const stream = mediaRef.current;
-      if (!client || !stream) return;
+      const media  = mediaRef.current;
+      if (!client || !media) return;
 
       const meId = client.getCurrentUserInfo()?.userId;
       if (uid === meId) { dbg('remote.attach.skip-self', { uid }); return; }
@@ -312,27 +257,17 @@ export default function ZoomMeetingComponent({
       const tile = ensureRemoteTile(user);
 
       if (!user.bVideoOn) {
-        if (attempt < 8) {
-          dbg('remote.attach.wait-video', { uid, attempt });
-          await sleep(180);
-          return attachRemote(uid, attempt + 1);
-        }
+        if (attempt < 6) { dbg('remote.attach.wait-video', { uid, attempt }); await sleep(200); return attachRemote(uid, attempt + 1); }
         dbg('remote.attach.abort-no-video', { uid });
         return;
       }
 
-      const el = await attachRemoteCompat(stream, uid, tile.slot, dbg);
+      const el = await attachRemoteCompat(media, uid, tile.slot, dbg);
       tile.actual = el;
-
-      // Measure sizes to confirm non-zero
-      measureTile(uid, tile, el, 'immediate');
-      requestAnimationFrame(() => measureTile(uid, tile, el, 'raf'));
-      setTimeout(() => measureTile(uid, tile, el, 't+200ms'), 200);
-
-      if (tag(el) !== 'canvas') hookVideoDebug(el, `remote-${uid}`, dbg);
+      dbg('remote.attach.ok', { uid, attempt, actual: tag(el) });
     } catch (e) {
       dbg('remote.attach.fail', { uid, attempt, err: niceErr(e) });
-      if (attempt < 8) { await sleep(240); return attachRemote(uid, attempt + 1); }
+      if (attempt < 6) { await sleep(300); return attachRemote(uid, attempt + 1); }
     }
   };
 
@@ -340,6 +275,7 @@ export default function ZoomMeetingComponent({
     const tile = remoteTilesRef.current.get(uid);
     try { await detachRemoteCompat(mediaRef.current, uid, tile?.actual || tile?.slot, dbg); } catch {}
   };
+
   const removeRemoteTile = async (uid) => {
     await detachRemote(uid);
     const tile = remoteTilesRef.current.get(uid);
@@ -347,7 +283,7 @@ export default function ZoomMeetingComponent({
     remoteTilesRef.current.delete(uid);
   };
 
-  /* ---- Join & events ---- */
+  // ---- Join & events ----
   useEffect(() => {
     if (!callId && !token) return;
     let mounted = true;
@@ -383,7 +319,7 @@ export default function ZoomMeetingComponent({
             const url = new URL(`https://app.zoom.us/wc/join/${data.meetingNumber}`);
             if (data.password) url.searchParams.set('pwd', data.password);
             url.searchParams.set('prefer', '1');
-            url.searchParams.set('un', btoa(unescape(encodeURIComponent(payload.userName))));
+            url.searchParams.set('un', btoa(unescape(encodeURIComponent(payload.userName)))); // base64 username
             window.location.replace(url.toString()); return;
           }
 
@@ -410,13 +346,14 @@ export default function ZoomMeetingComponent({
         mediaRef.current = media;
 
         try {
-          const cams = await maybeAwait(media.getCameraList?.());
-          if (Array.isArray(cams) && cams.length) {
-            setCams(cams);
-            setCamId((prev) => prev || cams[0]?.deviceId || '');
+          const list = await maybeAwait(media.getCameraList?.());
+          if (Array.isArray(list) && list.length) {
+            setCams(list);
+            setCamId((prev) => prev || list[0]?.deviceId || '');
           }
         } catch {}
 
+        // Don’t auto-start (mobile autoplay)
         setMicOn(false); setCamOn(false); setNeedsGesture(true);
 
         // hydrate remotes
@@ -507,20 +444,21 @@ export default function ZoomMeetingComponent({
     };
   }, [callId, locationName, role, userId, token]);
 
-  /* ---- Self camera ---- */
+  // ---- Camera start/stop/switch (SELF) ----
   const startCam = async () => {
     setError('');
     const media = mediaRef.current;
     const client = clientRef.current;
     if (!media || !client) return;
 
-    // Pre-warm permission with the chosen device for clearer errors
+    // Pre-warm permission with the chosen device for better error messages
     try {
       const constraints = camId ? { video: { deviceId: { exact: camId } } } : { video: true };
       const tmp = await navigator.mediaDevices.getUserMedia(constraints);
       tmp.getTracks().forEach((t) => t.stop());
     } catch (e) { setError(mapCameraError(e)); return; }
 
+    // Start video by binding directly to the <video> element
     const el = selfVideoRef.current;
     try {
       dbg('self.startVideo.withElement', { deviceId: camId || '(default)', tag: tag(el) });
@@ -537,7 +475,6 @@ export default function ZoomMeetingComponent({
 
   const stopCam = async () => { try { await maybeAwait(mediaRef.current?.stopVideo()); } catch {} setCamOn(false); };
 
-  // Camera switch
   useEffect(() => {
     (async () => {
       const media = mediaRef.current;
@@ -551,53 +488,34 @@ export default function ZoomMeetingComponent({
 
   const toggleCam = async () => (camOn ? stopCam() : startCam());
 
-  /* ---- Mic ---- */
+  // ---- Mic ----
   const toggleMic = async () => {
     const media = mediaRef.current;
     if (!media) return;
-    try {
-      if (micOn) { await maybeAwait(media.stopAudio()); setMicOn(false); }
-      else       { await maybeAwait(media.startAudio()); setMicOn(true); }
-    } catch (e) {
-      setError('Microphone error: ' + (e?.reason || e?.message || 'unknown'));
-    }
+    try { if (micOn) { await maybeAwait(media.stopAudio()); setMicOn(false); }
+          else       { await maybeAwait(media.startAudio()); setMicOn(true); } }
+    catch (e) { setError('Microphone error: ' + (e?.reason || e?.message || 'unknown')); }
   };
 
   const handleEnable = async () => { await startCam(); await toggleMic(); };
 
-  /* ---- UI ---- */
+  // ---- UI ----
   return (
     <div style={{ width: '100%', height: '100%', display: 'grid', gridTemplateRows: 'auto 1fr', background: '#000', color: '#fff' }}>
       <div style={{ padding: 12, display: 'flex', alignItems: 'center', gap: 10, background: 'rgba(255,255,255,.06)', borderBottom: '1px solid rgba(255,255,255,.07)' }}>
         <strong style={{ letterSpacing: '.2px' }}>{locationName ? `Clinic – ${locationName}` : 'Clinic'}</strong>
 
         {cams.length > 1 && (
-          <select value={camId} onChange={(e) => setCamId(e.target.value)}
-                  style={{ marginLeft: 12, background: '#111', color: '#fff', borderRadius: 6, border: '1px solid #333', padding: '4px 8px' }}
-                  title="Camera">
+          <select value={camId} onChange={(e) => setCamId(e.target.value)} style={{ marginLeft: 12, background: '#111', color: '#fff', borderRadius: 6, border: '1px solid #333', padding: '4px 8px' }} title="Camera">
             {cams.map((c) => (<option key={c.deviceId} value={c.deviceId}>{c.label || 'Camera'}</option>))}
           </select>
         )}
 
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
-          <button onClick={toggleMic}
-                  style={{ padding: '6px 12px', borderRadius: 8, border: 0, background: micOn ? '#2e8b57' : '#666', color: '#fff' }}>
-            {micOn ? 'Mic On' : 'Mic Off'}
-          </button>
-          <button onClick={toggleCam}
-                  style={{ padding: '6px 12px', borderRadius: 8, border: 0, background: camOn ? '#2e8b57' : '#666', color: '#fff' }}>
-            {camOn ? 'Cam On' : 'Cam Off'}
-          </button>
-          <button
-            onClick={() => {
-              try { maybeAwait(mediaRef.current?.stopVideo()); } catch {}
-              try { maybeAwait(mediaRef.current?.stopAudio()); } catch {}
-              try { clientRef.current?.leave(); } catch {}
-            }}
-            style={{ padding: '6px 12px', borderRadius: 8, background: '#d33', color: '#fff', border: 0 }}
-          >
-            Leave
-          </button>
+          <button onClick={toggleMic} style={{ padding: '6px 12px', borderRadius: 8, border: 0, background: micOn ? '#2e8b57' : '#666', color: '#fff' }}>{micOn ? 'Mic On' : 'Mic Off'}</button>
+          <button onClick={toggleCam} style={{ padding: '6px 12px', borderRadius: 8, border: 0, background: camOn ? '#2e8b57' : '#666', color: '#fff' }}>{camOn ? 'Cam On' : 'Cam Off'}</button>
+          <button onClick={() => { try { maybeAwait(mediaRef.current?.stopVideo()); } catch {} try { maybeAwait(mediaRef.current?.stopAudio()); } catch {} try { clientRef.current?.leave(); } catch {} }}
+                  style={{ padding: '6px 12px', borderRadius: 8, background: '#d33', color: '#fff', border: 0 }}>Leave</button>
         </div>
       </div>
 
@@ -611,39 +529,27 @@ export default function ZoomMeetingComponent({
           </div>
         </div>
 
-        {/* Remotes (grid of tiles) */}
+        {/* Remotes (container DIV) */}
         <div>
           <div style={{ color: '#bbb', marginBottom: 6, fontSize: 14 }}>Participants</div>
-          <div ref={remoteGridRef} id="remote-grid"
-               style={{ width: '100%', minHeight: 220, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12 }} />
+          <div ref={remoteGridRef} id="remote-grid" style={{ width: '100%', minHeight: 220, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12 }} />
         </div>
       </div>
 
-      {joining && (
-        <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,.35)', fontSize: 16 }}>
-          Connecting to session…
-        </div>
-      )}
+      {joining && (<div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,.35)', fontSize: 16 }}>Connecting to session…</div>)}
 
-      {(needsGesture || !!error) && (
+      {(needsGesture || (!!error && !camOn)) && (
         <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,.45)' }}>
           <div style={{ display: 'grid', gap: 10, placeItems: 'center' }}>
-            {!!error && (
-              <div style={{ background: 'rgba(220,0,0,.85)', padding: '8px 12px', borderRadius: 6, maxWidth: 520, lineHeight: 1.35 }}>
-                {String(error)}
-              </div>
-            )}
-            <button onClick={handleEnable}
-                    style={{ padding: '10px 14px', borderRadius: 8, border: 0, background: '#1f8fff', color: '#fff', fontWeight: 600 }}>
-              Enable mic & cam
-            </button>
+            {!!error && (<div style={{ background: 'rgba(220,0,0,.85)', padding: '8px 12px', borderRadius: 6, maxWidth: 520, lineHeight: 1.35 }}>{String(error)}</div>)}
+            <button onClick={handleEnable} style={{ padding: '10px 14px', borderRadius: 8, border: 0, background: '#1f8fff', color: '#fff', fontWeight: 600 }}>Enable mic & cam</button>
           </div>
         </div>
       )}
 
       {debug && (
         <div style={{
-          position: 'absolute', right: 8, bottom: 8, width: 420, maxHeight: 300, overflow: 'auto',
+          position: 'absolute', right: 8, bottom: 8, width: 380, maxHeight: 280, overflow: 'auto',
           fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 11,
           background: 'rgba(0,0,0,.55)', border: '1px solid rgba(255,255,255,.12)',
           borderRadius: 6, padding: 8, whiteSpace: 'pre-wrap'
