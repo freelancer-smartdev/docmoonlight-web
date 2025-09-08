@@ -1,5 +1,5 @@
 // pages/ZoomMeeting.jsx
-import { useRouter } from 'next/router';
+import { useRouter, useEffect } from 'next/router';
 import dynamic from 'next/dynamic';
 import Head from 'next/head';
 
