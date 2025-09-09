@@ -1,5 +1,6 @@
 // pages/ZoomMeeting.jsx
-import { useRouter, useEffect } from 'next/router';
+import { useRouter } from 'next/router';
+import { useEffect } from 'react';
 import dynamic from 'next/dynamic';
 import Head from 'next/head';
 
@@ -9,17 +10,17 @@ const ZoomMeetingComponent = dynamic(
 );
 
 export default function ZoomMeeting() {
-  // useEffect(() => {
-  //   const html = document.documentElement;
-  //   const body = document.body;
-  //   html.classList.add("is-meeting-page");
-  //   body.classList.add("is-meeting-page");
+  useEffect(() => {
+    const html = document.documentElement;
+    const body = document.body;
+    html.classList.add("is-meeting-page");
+    body.classList.add("is-meeting-page");
 
-  //   return () => {
-  //     html.classList.remove("is-meeting-page");
-  //     body.classList.remove("is-meeting-page");
-  //   };
-  // }, []);
+    return () => {
+      html.classList.remove("is-meeting-page");
+      body.classList.remove("is-meeting-page");
+    };
+  }, []);
   const { query } = useRouter();
 
   const callId =
