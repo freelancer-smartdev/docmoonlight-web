@@ -4,7 +4,7 @@ import axios from 'axios';
 import ZoomVideo from '@zoom/videosdk';
 
 const API_BASE = '/api';
-const BUILD = 'ZMC-v6.7-remote-video-fill-2025-09-07';
+const BUILD = 'ZMC-v6.8-android-prefers-container-2025-09-07';
 
 const asArray = (x) => (Array.isArray(x) ? x : x ? [x] : []);
 const displayNameFor = (role, location) =>
@@ -100,71 +100,13 @@ function forceFill(el) {
 }
 function placeInSlot(slotDiv, el, dbg, uid) {
   try {
-    // Ensure slot is a positioned parent so the child can absolutely fill it.
     if (getComputedStyle(slotDiv).position === 'static') slotDiv.style.position = 'relative';
     slotDiv.replaceChildren(el);
-    // one more nudge in case the element has internal style rules
     forceFill(el);
     const r = el.getBoundingClientRect?.();
     dbg('remote.place.appended', { uid, el: tag(el), w: Math.round(r?.width||0), h: Math.round(r?.height||0) });
   } catch (err) {
     dbg('remote.place.fail', { uid, err: String(err) });
-  }
-}
-
-/**
- * Attach remote video via attachVideo. Canvas fallback is skipped by default
- * (recent SDK builds tell us to "Use the attachVideo method").
- */
-async function attachRemoteCompat(stream, userId, slotDiv, dbg) {
-  const Q = (ZoomVideo?.VideoQuality?.Video_360P) ?? 2;
-
-  // New API with our own <video>
-  try {
-    const vid = makeVideoEl();
-    // Prepare the slot
-    slotDiv.style.position = 'relative';
-    slotDiv.replaceChildren(vid);
-
-    dbg('remote.attach.new', { userId, target: 'video' });
-    const maybeEl = await maybeAwait(stream.attachVideo(userId, Q, vid));
-    const actual = (maybeEl && maybeEl.nodeType === 1) ? maybeEl : vid;
-
-    // Put the (possibly returned) element inside the slot and force-fill it
-    placeInSlot(slotDiv, forceFill(actual), dbg, userId);
-    return actual;
-  } catch (e) {
-    dbg('remote.attach.new.fail', { userId, err: niceErr(e) });
-  }
-
-  // Old: attachVideo(video, userId)
-  try {
-    const vid = makeVideoEl();
-    slotDiv.style.position = 'relative';
-    slotDiv.replaceChildren(vid);
-
-    dbg('remote.attach.old.v1', { userId, target: 'video' });
-    await maybeAwait(stream.attachVideo(vid, userId));
-    placeInSlot(slotDiv, forceFill(vid), dbg, userId);
-    return vid;
-  } catch (e1) {
-    dbg('remote.attach.old.v1.fail', { userId, err: niceErr(e1) });
-  }
-
-  // Old alt: attachVideo(userId, video)
-  try {
-    const vid = makeVideoEl();
-    slotDiv.style.position = 'relative';
-    slotDiv.replaceChildren(vid);
-
-    dbg('remote.attach.old.v2', { userId, target: 'video' });
-    const maybeEl = await maybeAwait(stream.attachVideo(userId, vid));
-    const actual = (maybeEl && maybeEl.nodeType === 1) ? maybeEl : vid;
-    placeInSlot(slotDiv, forceFill(actual), dbg, userId);
-    return actual;
-  } catch (e2) {
-    dbg('remote.attach.old.v2.fail', { userId, err: niceErr(e2) });
-    throw e2;
   }
 }
 
@@ -174,6 +116,82 @@ async function detachRemoteCompat(stream, userId, el, dbg) {
     try { dbg('remote.detach.old', { userId, target: tag(el) }); await maybeAwait(stream.detachVideo?.(el, userId)); }
     catch { try { await maybeAwait(stream.stopRender?.(userId)); } catch {} }
   }
+}
+
+/**
+ * Strategy:
+ *  1) On mobile, prefer container signature: attachVideo(userId, quality, <div/>)
+ *  2) Fallback to video signature
+ *  3) Fallback to canvas render
+ * Post-check: if 0×0 or videoWidth/videoHeight are 0, reattach using the other path.
+ */
+async function attachRemoteCompat(stream, userId, slotDiv, dbg, preferContainer) {
+  const Q = (ZoomVideo?.VideoQuality?.Video_360P) ?? 2;
+
+  const viaContainer = async () => {
+    slotDiv.replaceChildren();
+    slotDiv.style.position = 'relative';
+    dbg('remote.attach.container', { userId });
+    const maybeEl = await maybeAwait(stream.attachVideo(userId, Q, slotDiv));
+    const el = (maybeEl && maybeEl.nodeType === 1) ? maybeEl : (slotDiv.firstElementChild || slotDiv);
+    try { Object.assign(el.style, { position:'absolute', inset:'0', width:'100%', height:'100%', display:'block' }); } catch {}
+    return el;
+  };
+
+  const viaVideo = async () => {
+    const vid = makeVideoEl();
+    slotDiv.style.position = 'relative';
+    slotDiv.replaceChildren(vid);
+    dbg('remote.attach.video', { userId });
+    const maybeEl = await maybeAwait(stream.attachVideo(userId, Q, vid));
+    return (maybeEl && maybeEl.nodeType === 1) ? maybeEl : vid;
+  };
+
+  const viaCanvas = async () => {
+    const canvas = document.createElement('canvas');
+    Object.assign(canvas.style, { position:'absolute', inset:'0', width:'100%', height:'100%', display:'block', background:'#111' });
+    slotDiv.style.position = 'relative';
+    slotDiv.replaceChildren(canvas);
+    const { w, h } = sizeOf(slotDiv);
+    dbg('remote.canvas.render.begin', { userId, w, h });
+    await maybeAwait(stream.renderVideo(canvas, userId, w, h, 0, 0));
+    return canvas;
+  };
+
+  const order = preferContainer ? [viaContainer, viaVideo, viaCanvas] : [viaVideo, viaContainer, viaCanvas];
+
+  let el = null;
+  for (const fn of order) {
+    try {
+      el = await fn();
+      placeInSlot(slotDiv, el, dbg, userId);
+      dbg('remote.attach.ok', { uid: userId, via: fn.name, tag: tag(el) });
+      break;
+    } catch (e) {
+      dbg(`remote.${fn.name}.fail`, { uid: userId, err: niceErr(e) });
+    }
+  }
+  if (!el) throw new Error('Could not attach remote video');
+
+  // Post-check; retry with flipped preference if needed.
+  setTimeout(async () => {
+    const r = el.getBoundingClientRect?.() || {};
+    const w = Math.round(r.width||0), h = Math.round(r.height||0);
+    const inner = findInnerVideo(el); const vw = inner?.videoWidth || 0, vh = inner?.videoHeight || 0;
+    dbg('remote.postcheck', { uid: userId, w, h, vw, vh });
+    if ((w === 0 || h === 0 || vw === 0 || vh === 0) && tag(el) !== 'canvas') {
+      dbg('remote.postcheck.retry', { uid: userId });
+      try { await detachRemoteCompat(stream, userId, el, dbg); } catch {}
+      try {
+        const retry = await attachRemoteCompat(stream, userId, slotDiv, dbg, !preferContainer);
+        dbg('remote.postcheck.retry.ok', { uid: userId, tag: tag(retry) });
+      } catch (err) {
+        dbg('remote.postcheck.retry.fail', { uid: userId, err: niceErr(err) });
+      }
+    }
+  }, 450);
+
+  return el;
 }
 
 /* ---------- COMPONENT ---------- */
@@ -242,13 +260,13 @@ export default function ZoomMeetingComponent({
       display: 'grid',
     });
 
-    const slot = document.createElement('div'); // host for <video>/<video-player>
+    const slot = document.createElement('div'); // host for player
     Object.assign(slot.style, {
       width: '100%',
       height: '100%',
       display: 'block',
       background: '#111',
-      position: 'relative', // needed for child absolute fill
+      position: 'relative',
     });
 
     const label = document.createElement('div');
@@ -321,10 +339,9 @@ export default function ZoomMeetingComponent({
         return;
       }
 
-      const el = await attachRemoteCompat(stream, uid, tile.slot, dbg);
+      const el = await attachRemoteCompat(stream, uid, tile.slot, dbg, true /* prefer container on mobile */);
       tile.actual = el;
 
-      // Measure sizes to confirm non-zero
       measureTile(uid, tile, el, 'immediate');
       requestAnimationFrame(() => measureTile(uid, tile, el, 'raf'));
       setTimeout(() => measureTile(uid, tile, el, 't+200ms'), 200);
@@ -625,7 +642,8 @@ export default function ZoomMeetingComponent({
         </div>
       )}
 
-      {(needsGesture || !!error) && (
+      {/* Don’t let the overlay hide video unless there’s an error AND your cam isn’t running */}
+      {((needsGesture && !camOn && !micOn) || (!!error && !camOn)) && (
         <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,.45)' }}>
           <div style={{ display: 'grid', gap: 10, placeItems: 'center' }}>
             {!!error && (
