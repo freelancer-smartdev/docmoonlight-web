@@ -4,7 +4,7 @@ import axios from 'axios';
 import ZoomVideo from '@zoom/videosdk';
 
 const API_BASE = '/api';
-const BUILD = 'ZMC-v7.2-mobile-canvas-escalation-logs-2025-09-09';
+const BUILD = 'ZMC-v7.3-mobile-subscribe-180p-canvas-min-retry-2025-09-09';
 
 const asArray = (x) => (Array.isArray(x) ? x : x ? [x] : []);
 const displayNameFor = (role, location) =>
@@ -32,7 +32,7 @@ const tag = (el) => (el && el.tagName ? el.tagName.toLowerCase() : String(el));
 const niceErr = (e) =>
   typeof e === 'string'
     ? e
-    : JSON.stringify({ name: e?.name, message: e?.message, reason: e?.reason, code: e?.code });
+    : JSON.stringify({ name: e?.name, message: e?.message, reason: e?.reason, code: e?.code, stack: e?.stack && String(e.stack).slice(0,200) });
 
 function mapCameraError(e) {
   const s = (e?.name || e?.message || e?.reason || '').toLowerCase();
@@ -63,7 +63,6 @@ function hookVideoDebug(el, label, dbg) {
   ['loadedmetadata','loadeddata','canplay','play','playing','pause','waiting','stalled','error','resize','emptied','ended']
     .forEach((e) => v.addEventListener(e, log));
 
-  // Prove motion & dimensions for ~15s
   let n = 0; const t = setInterval(() => {
     n++; dbg(`video.${label}.tick`, { id, ct: v.currentTime, vw: v.videoWidth, vh: v.videoHeight });
     if (n >= 15) clearInterval(t);
@@ -89,17 +88,34 @@ function fill(el) {
 /* ---------- per-user paint attempts (to escalate to canvas) ---------- */
 const paintAttempts = new Map(); // userId -> number
 
-/* ---------- REMOTE ATTACH (try sigs, then canvas if not painting) ---------- */
+/* ---------- REMOTE ATTACH (subscribe + try sigs, then canvas if not painting) ---------- */
 async function attachRemoteCompat(stream, userId, slotDiv, dbg, prefer = 'auto') {
-  const Q = (ZoomVideo?.VideoQuality?.Video_360P) ?? 2;
-  Object.assign(slotDiv.style, { position: 'relative', background: '#111' });
+  const isMobile = typeof navigator !== 'undefined' && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+  const Q180 = (ZoomVideo?.VideoQuality?.Video_180P) ?? 1;
+  const Q360 = (ZoomVideo?.VideoQuality?.Video_360P) ?? 2;
+  const Q = isMobile ? Q180 : Q360;
+
+  Object.assign(slotDiv.style, { position: 'relative', background: '#111', minHeight: '120px' });
+
+  // Try to explicitly subscribe at chosen quality before attaching
+  try {
+    if (typeof stream.subscribeVideo === 'function') {
+      dbg('remote.subscribeVideo.attempt', { uid: userId, Q, isMobile });
+      await maybeAwait(stream.subscribeVideo(userId, Q));
+      dbg('remote.subscribeVideo.ok', { uid: userId, Q });
+    } else {
+      dbg('remote.subscribeVideo.skip', { uid: userId, reason: 'no-method' });
+    }
+  } catch (e) {
+    dbg('remote.subscribeVideo.fail', { uid: userId, err: niceErr(e), Q });
+  }
 
   const viaSigA = async () => {
     const vid = makeVideoEl();
     slotDiv.textContent = '';
     slotDiv.appendChild(vid);
     dbg('remote.attach.sigA (videoEl, userId)', { uid: userId });
-    await maybeAwait(stream.attachVideo(vid, userId));
+    try { await maybeAwait(stream.attachVideo(vid, userId)); } catch (e) { dbg('remote.sigA.attachVideo.error', { uid: userId, err: niceErr(e) }); throw e; }
     fill(vid);
     return vid;
   };
@@ -108,8 +124,11 @@ async function attachRemoteCompat(stream, userId, slotDiv, dbg, prefer = 'auto')
     slotDiv.textContent = '';
     slotDiv.appendChild(vid);
     dbg('remote.attach.sigB (userId, videoEl)', { uid: userId });
-    const ret = await maybeAwait(stream.attachVideo(userId, vid));
-    const el = (ret && ret.nodeType === 1) ? ret : vid;
+    let el;
+    try {
+      const ret = await maybeAwait(stream.attachVideo(userId, vid));
+      el = (ret && ret.nodeType === 1) ? ret : vid;
+    } catch (e) { dbg('remote.sigB.attachVideo.error', { uid: userId, err: niceErr(e) }); throw e; }
     fill(el);
     return el;
   };
@@ -118,16 +137,22 @@ async function attachRemoteCompat(stream, userId, slotDiv, dbg, prefer = 'auto')
     slotDiv.textContent = '';
     slotDiv.appendChild(vid);
     dbg('remote.attach.sigC (userId, quality, videoEl)', { uid: userId, Q });
-    const ret = await maybeAwait(stream.attachVideo(userId, Q, vid));
-    const el = (ret && ret.nodeType === 1) ? ret : vid;
+    let el;
+    try {
+      const ret = await maybeAwait(stream.attachVideo(userId, Q, vid));
+      el = (ret && ret.nodeType === 1) ? ret : vid;
+    } catch (e) { dbg('remote.sigC.attachVideo.error', { uid: userId, err: niceErr(e) }); throw e; }
     fill(el);
     return el;
   };
   const viaSigD = async () => {
     dbg('remote.attach.sigD (userId, quality, containerDiv)', { uid: userId, Q });
     slotDiv.textContent = '';
-    const ret = await maybeAwait(stream.attachVideo(userId, Q, slotDiv));
-    const player = (ret && ret.nodeType === 1) ? ret : (slotDiv.firstElementChild || slotDiv);
+    let player;
+    try {
+      const ret = await maybeAwait(stream.attachVideo(userId, Q, slotDiv));
+      player = (ret && ret.nodeType === 1) ? ret : (slotDiv.firstElementChild || slotDiv);
+    } catch (e) { dbg('remote.sigD.attachVideo.error', { uid: userId, err: niceErr(e) }); throw e; }
     if (player !== slotDiv) fill(player);
     return player;
   };
@@ -136,20 +161,44 @@ async function attachRemoteCompat(stream, userId, slotDiv, dbg, prefer = 'auto')
     fill(canvas);
     slotDiv.textContent = '';
     slotDiv.appendChild(canvas);
+
+    // Start small on mobile to kickstart decoder, then resize up
     const { w, h } = sizeOf(slotDiv);
-    dbg('remote.canvas.render.begin', { uid: userId, w, h });
-    await maybeAwait(stream.renderVideo(canvas, userId, Math.max(2, w), Math.max(2, h), 0, 0));
-    dbg('remote.canvas.render.ok', { uid: userId, cw: canvas.width, ch: canvas.height });
+    const w1 = Math.max(2, Math.min(160, w));
+    const h1 = Math.max(2, Math.min(120, h));
+
+    dbg('remote.canvas.render.begin', { uid: userId, w, h, initial: { w1, h1 } });
+    try {
+      await maybeAwait(stream.renderVideo(canvas, userId, w1, h1, 0, 0));
+      dbg('remote.canvas.render.ok-initial', { uid: userId, cw: canvas.width, ch: canvas.height });
+    } catch (e) {
+      dbg('remote.canvas.render.error-initial', { uid: userId, err: niceErr(e) });
+      throw e;
+    }
+
+    // Try to grow to target slot size
+    try {
+      const w2 = Math.max(2, w);
+      const h2 = Math.max(2, h);
+      if (typeof stream.updateVideoCanvasDimension === 'function') {
+        dbg('remote.canvas.render.resize', { uid: userId, w2, h2 });
+        await maybeAwait(stream.updateVideoCanvasDimension(userId, w2, h2));
+      }
+    } catch (e) {
+      dbg('remote.canvas.render.resize.error', { uid: userId, err: niceErr(e) });
+    }
+
     // Track size changes for quality & log
     try {
       const ro = new ResizeObserver(() => {
         const { w: nw, h: nh } = sizeOf(slotDiv);
-        dbg('remote.canvas.resize', { uid: userId, nw, nh });
+        dbg('remote.canvas.resizeObserver', { uid: userId, nw, nh });
         stream.updateVideoCanvasDimension?.(userId, Math.max(2, nw), Math.max(2, nh));
       });
       ro.observe(slotDiv);
       canvas._ro = ro;
     } catch {}
+
     return canvas;
   };
 
@@ -191,9 +240,8 @@ async function attachRemoteCompat(stream, userId, slotDiv, dbg, prefer = 'auto')
       const tries = (paintAttempts.get(userId) || 0) + 1;
       paintAttempts.set(userId, tries);
 
-      // First retry flips video/container, second or later goes straight to canvas
       let nextPrefer = (prefer === 'container') ? 'video' : 'container';
-      if (tries >= 2) nextPrefer = 'canvas';
+      if (tries >= 1) nextPrefer = 'canvas'; // go canvas sooner on mobile issue
 
       if (tag(el) !== 'canvas') {
         dbg('remote.postcheck.retry', { uid: userId, from: tag(el), prefer, tries, nextPrefer });
@@ -344,7 +392,6 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
       const meId = client.getCurrentUserInfo()?.userId;
       if (uid === meId) { dbg('remote.attach.skip-self', { uid }); return; }
 
-      // Introspection helpful for triage
       try {
         const a = stream.attachVideo;
         dbg('attachVideo.introspect', { type: typeof a, length: a?.length, name: a?.name });
@@ -680,8 +727,6 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
           }}>
             {debugLines.join('\n')}
           </div>
-
-          {/* Handy "Dump users" button */}
           <button
             onClick={() => {
               try {
