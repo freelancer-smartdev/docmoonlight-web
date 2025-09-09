@@ -13,14 +13,14 @@ export default function ZoomMeeting() {
   useEffect(() => {
     const html = document.documentElement;
     const body = document.body;
-    html.classList.add("is-meeting-page");
-    body.classList.add("is-meeting-page");
-
+    html.classList.add('is-meeting-page');
+    body.classList.add('is-meeting-page');
     return () => {
-      html.classList.remove("is-meeting-page");
-      body.classList.remove("is-meeting-page");
+      html.classList.remove('is-meeting-page');
+      body.classList.remove('is-meeting-page');
     };
   }, []);
+
   const { query } = useRouter();
 
   const callId =
@@ -29,9 +29,8 @@ export default function ZoomMeeting() {
   const token =
     typeof query.token === 'string' ? query.token : Array.isArray(query.token) ? query.token[0] : undefined;
 
-  const role = Number(
-    typeof query.role === 'string' ? query.role : Array.isArray(query.role) ? query.role[0] : '0'
-  ) || 0;
+  const role =
+    Number(typeof query.role === 'string' ? query.role : Array.isArray(query.role) ? query.role[0] : '0') || 0;
 
   const userId = (() => {
     const raw = typeof query.user_id === 'string' ? query.user_id : Array.isArray(query.user_id) ? query.user_id[0] : '';
@@ -48,7 +47,11 @@ export default function ZoomMeeting() {
 
   return (
     <div style={{ height: '100vh', width: '100vw', background: '#000' }}>
-      <Head><title>Video Session</title></Head>
+      <Head>
+        <title>Video Session</title>
+        {/* Make sure mobile lays out correctly */}
+        <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+      </Head>
       <ZoomMeetingComponent
         token={token}
         callId={callId}
