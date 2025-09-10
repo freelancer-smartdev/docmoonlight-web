@@ -4,7 +4,7 @@ import axios from 'axios';
 import ZoomVideo from '@zoom/videosdk';
 
 const API_BASE = '/api';
-const BUILD = 'ZMC-v7.4-mobile-attach-only-video-player-postcheck-2025-09-09';
+const BUILD = 'ZMC-v7.5-mobile-remote-visible-nonblocking-error-2025-09-10';
 
 const asArray = (x) => (Array.isArray(x) ? x : x ? [x] : []);
 const displayNameFor = (role, location) =>
@@ -52,7 +52,7 @@ function makeVideoEl() {
   const v = document.createElement('video');
   v.autoplay = true;
   v.playsInline = true;
-  v.muted = true;
+  v.muted = true; // remote element muted is fine; audio path is separate via SDK
   Object.assign(v.style, { width: '100%', height: '100%', objectFit: 'cover', display: 'block', background: '#111' });
   return v;
 }
@@ -87,6 +87,12 @@ async function attachRemoteCompat(stream, userId, slotDiv, dbg, prefer = 'auto')
     const ret = await maybeAwait(stream.attachVideo(userId, vid));
     const el = (ret && ret.nodeType === 1) ? ret : vid; // some SDKs return <video-player>
     fill(el);
+    // ensure mobile-friendly attrs if it's actually a <video>
+    if (el?.tagName?.toLowerCase() === 'video') {
+      el.setAttribute('playsinline', 'true');
+      el.muted = true;
+      el.autoplay = true;
+    }
     return el;
   };
 
@@ -136,13 +142,12 @@ async function attachRemoteCompat(stream, userId, slotDiv, dbg, prefer = 'auto')
       }, 1000);
 
       // If the SDK returned its custom <video-player>, we cannot read videoWidth/videoHeight.
-      // Trust the SDK; just ensure the element is visible and sized.
       if (tag(el) === 'video-player') {
         attachAttempts.set(userId, 0);
         return;
       }
 
-      // If SDK actually returned <video>, do a basic vw/vh check (rare in your build)
+      // If SDK actually returned <video>, do a basic vw/vh check
       const v = el.tagName?.toLowerCase() === 'video' ? el : null;
       const vw = v?.videoWidth || 0, vh = v?.videoHeight || 0;
       dbg('remote.postcheck.video-metrics', { uid: userId, vw, vh });
@@ -197,7 +202,8 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
   const [camOn, setCamOn]     = useState(false);
 
   const isMobileUA = typeof navigator !== 'undefined' && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
-  const [needsGesture, setNeedsGesture] = useState(isMobileUA);
+  // IMPORTANT: do not block the view by default; let remote video render
+  const [needsGesture, setNeedsGesture] = useState(false);
 
   const [cams, setCams] = useState([]);
   const [camId, setCamId] = useState('');
@@ -400,7 +406,10 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
           if (Array.isArray(cams) && cams.length) { setCams(cams); setCamId((prev) => prev || cams[0]?.deviceId || ''); }
         } catch {}
 
-        setMicOn(false); setCamOn(false); setNeedsGesture(true);
+        setMicOn(false);
+        setCamOn(false);
+        // CRITICAL: keep overlay off so remote is always visible regardless of mic/cam permission
+        setNeedsGesture(false);
 
         // hydrate remotes
         logUsers(client, 'after-join');
@@ -540,9 +549,10 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
 
   const handleEnable = async () => {
     console.log('[VideoSDK] gesture.enable.begin', { ua: navigator.userAgent });
-    await startCam();
-    await toggleMic();
-    console.log('[VideoSDK] gesture.enable.done', {});
+    setNeedsGesture(false); // dismiss overlay immediately so remote video is visible
+    try { await toggleMic(); } catch {}
+    try { await startCam(); } catch {}
+    console.log('[VideoSDK] gesture.enable.done');
   };
 
   /* ---- UI ---- */
@@ -605,15 +615,22 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
         </div>
       )}
 
-      {/* Gesture + error overlay */}
-      {(needsGesture || !!error) && (
+      {/* Non-blocking error banner */}
+      {!!error && (
+        <div style={{
+          position:'absolute', left:8, right:8, top:8, zIndex:30,
+          background:'rgba(220,0,0,.9)', padding:'8px 12px', borderRadius:6, lineHeight:1.35
+        }}>
+          {String(error)}
+        </div>
+      )}
+
+      {/* Optional gesture overlay (now ONLY if explicitly enabled) */}
+      {needsGesture && (
         <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,.45)' }}>
-          <div style={{ display: 'grid', gap: 10, placeItems: 'center' }}>
-            {!!error && <div style={{ background: 'rgba(220,0,0,.85)', padding: '8px 12px', borderRadius: 6, maxWidth: 520, lineHeight: 1.35 }}>{String(error)}</div>}
-            <button onClick={handleEnable} style={{ padding: '10px 14px', borderRadius: 8, border: 0, background: '#1f8fff', color: '#fff', fontWeight: 600 }}>
-              Enable mic & cam
-            </button>
-          </div>
+          <button onClick={handleEnable} style={{ padding: '10px 14px', borderRadius: 8, border: 0, background: '#1f8fff', color: '#fff', fontWeight: 600 }}>
+            Enable mic & cam
+          </button>
         </div>
       )}
 
