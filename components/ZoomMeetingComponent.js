@@ -4,7 +4,7 @@ import axios from 'axios';
 import ZoomVideo from '@zoom/videosdk';
 
 const API_BASE = '/api';
-const BUILD = 'ZMC-v7.5-mobile-remote-visible-nonblocking-error-2025-09-10';
+const BUILD = 'ZMC-v7.6-mobile-nonzero-wait-retry-videoplayer-2025-09-10';
 
 const asArray = (x) => (Array.isArray(x) ? x : x ? [x] : []);
 const displayNameFor = (role, location) =>
@@ -52,7 +52,7 @@ function makeVideoEl() {
   const v = document.createElement('video');
   v.autoplay = true;
   v.playsInline = true;
-  v.muted = true; // remote element muted is fine; audio path is separate via SDK
+  v.muted = true;
   Object.assign(v.style, { width: '100%', height: '100%', objectFit: 'cover', display: 'block', background: '#111' });
   return v;
 }
@@ -67,6 +67,18 @@ function logComputed(dbg, el, label) {
   } catch {}
 }
 
+// Wait until an element has a non-zero client rect before continuing
+async function waitForNonZeroRect(el, label, dbg, timeoutMs = 1500, pollMs = 50) {
+  const t0 = Date.now();
+  let r = sizeOf(el);
+  while ((r.w === 0 || r.h === 0) && Date.now() - t0 < timeoutMs) {
+    await sleep(pollMs);
+    r = sizeOf(el);
+  }
+  dbg('layout.nonzero-check', { label, rect: r, waitedMs: Date.now() - t0 });
+  return r.w > 0 && r.h > 0;
+}
+
 /* ---------- per-user attach attempts ---------- */
 const attachAttempts = new Map(); // userId -> number
 
@@ -75,7 +87,19 @@ async function attachRemoteCompat(stream, userId, slotDiv, dbg, prefer = 'auto')
   const isMobile = typeof navigator !== 'undefined' && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
   const Q360 = (ZoomVideo?.VideoQuality?.Video_360P) ?? 2;
 
-  Object.assign(slotDiv.style, { position: 'relative', background: '#111', minHeight: '160px' });
+  // Give slot a definite box so the SDK player doesn't initialize at 0×0
+  Object.assign(slotDiv.style, {
+    position: 'relative',
+    background: '#111',
+    minHeight: '180px',
+    aspectRatio: '16 / 9',
+    // tiny GPU nudge; helps some Androids
+    transform: 'translateZ(0)',
+    willChange: 'transform'
+  });
+
+  // Ensure container is measurable before attaching
+  await waitForNonZeroRect(slotDiv, 'slot.beforeAttach', dbg);
 
   // ATTACH SIGNATURES (attachVideo only; no canvas)
   const viaSigB = async () => {
@@ -87,7 +111,6 @@ async function attachRemoteCompat(stream, userId, slotDiv, dbg, prefer = 'auto')
     const ret = await maybeAwait(stream.attachVideo(userId, vid));
     const el = (ret && ret.nodeType === 1) ? ret : vid; // some SDKs return <video-player>
     fill(el);
-    // ensure mobile-friendly attrs if it's actually a <video>
     if (el?.tagName?.toLowerCase() === 'video') {
       el.setAttribute('playsinline', 'true');
       el.muted = true;
@@ -141,9 +164,26 @@ async function attachRemoteCompat(stream, userId, slotDiv, dbg, prefer = 'auto')
         if (ticks >= 10) clearInterval(t);
       }, 1000);
 
-      // If the SDK returned its custom <video-player>, we cannot read videoWidth/videoHeight.
+      const tries = (attachAttempts.get(userId) || 0);
+
+      // If the SDK returned its custom <video-player>, we can't read videoWidth/videoHeight.
+      // But if either the player or container ended up 0×0, detach & reattach once with the alternate signature.
       if (tag(el) === 'video-player') {
-        attachAttempts.set(userId, 0);
+        if ((eb.w === 0 || eb.h === 0 || sb.w === 0 || sb.h === 0) && tries < 2) {
+          attachAttempts.set(userId, tries + 1);
+          const nextPrefer = (prefer === 'container') ? 'video' : 'container';
+          dbg('remote.postcheck.videoplayer.zero-retry', { uid: userId, eb, sb, prefer, nextPrefer, tries });
+          try { await maybeAwait(stream.detachVideo?.(userId)); } catch {}
+          try {
+            await waitForNonZeroRect(slotDiv, 'slot.beforeReattach', dbg);
+            const el2 = await attachRemoteCompat(stream, userId, slotDiv, dbg, nextPrefer);
+            dbg('remote.postcheck.videoplayer.zero-retry.ok', { uid: userId, tag: tag(el2), prefer: nextPrefer });
+          } catch (e2) {
+            dbg('remote.postcheck.videoplayer.zero-retry.fail', { uid: userId, err: niceErr(e2) });
+          }
+        } else {
+          attachAttempts.set(userId, 0);
+        }
         return;
       }
 
@@ -156,14 +196,13 @@ async function attachRemoteCompat(stream, userId, slotDiv, dbg, prefer = 'auto')
         return;
       }
 
-      // Retry once switching signature (only attach paths)
-      const tries = (attachAttempts.get(userId) || 0) + 1;
-      attachAttempts.set(userId, tries);
-      if (tries <= 1) {
+      if (tries < 2) {
+        attachAttempts.set(userId, tries + 1);
         const nextPrefer = (prefer === 'container') ? 'video' : 'container';
         dbg('remote.postcheck.retry-attach', { uid: userId, from: tag(el), prefer, tries, nextPrefer });
         try { await maybeAwait(stream.detachVideo?.(userId)); } catch {}
         try {
+          await waitForNonZeroRect(slotDiv, 'slot.beforeReattach', dbg);
           const el2 = await attachRemoteCompat(stream, userId, slotDiv, dbg, nextPrefer);
           dbg('remote.postcheck.retry-attach.ok', { uid: userId, tag: tag(el2), prefer: nextPrefer });
         } catch (e2) {
@@ -202,7 +241,7 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
   const [camOn, setCamOn]     = useState(false);
 
   const isMobileUA = typeof navigator !== 'undefined' && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
-  // IMPORTANT: do not block the view by default; let remote video render
+  // Keep overlay off by default so remote video can show regardless of mic/cam state
   const [needsGesture, setNeedsGesture] = useState(false);
 
   const [cams, setCams] = useState([]);
@@ -258,12 +297,23 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
 
     const wrapper = document.createElement('div');
     Object.assign(wrapper.style, {
-      position: 'relative', background: '#111', borderRadius: '12px', overflow: 'hidden',
-      minHeight: '180px', boxShadow: '0 2px 10px rgba(0,0,0,.35)', display: 'grid'
+      position: 'relative',
+      background: '#111',
+      borderRadius: '12px',
+      overflow: 'hidden',
+      minHeight: '180px',
+      // grid can produce auto-height timing issues; a simple block is safer here
+      display: 'block',
+      boxShadow: '0 2px 10px rgba(0,0,0,.35)'
     });
 
     const slot = document.createElement('div');
-    Object.assign(slot.style, { width: '100%', height: '100%', position: 'relative', background: '#111' });
+    Object.assign(slot.style, {
+      width: '100%',
+      height: '100%',
+      position: 'relative',
+      background: '#111'
+    });
 
     const label = document.createElement('div');
     label.textContent = user.displayName || `User ${uid}`;
@@ -276,9 +326,9 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
     wrapper.appendChild(label);
     remoteGridRef.current?.appendChild(wrapper);
 
-    tile = { wrapper, slot, label, actual: null };
-    remoteTilesRef.current.set(uid, tile);
-    return tile;
+    const tileObj = { wrapper, slot, label, actual: null };
+    remoteTilesRef.current.set(uid, tileObj);
+    return tileObj;
   };
 
   const logUsers = (client, label) => {
@@ -309,6 +359,9 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
 
       const user = (client.getAllUser() || []).find((u) => u.userId === uid) || { userId: uid };
       const tile = ensureRemoteTile(user);
+
+      // Wait a moment for the tile to actually hit layout (esp. on mobile)
+      await waitForNonZeroRect(tile.slot, 'tile.slot.beforeAttach', dbg, 1200, 60);
 
       if (!user.bVideoOn) {
         if (attempt < 8) { dbg('remote.attach.wait-video', { uid, attempt }); await sleep(200); return attachRemote(uid, attempt + 1); }
@@ -408,8 +461,7 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
 
         setMicOn(false);
         setCamOn(false);
-        // CRITICAL: keep overlay off so remote is always visible regardless of mic/cam permission
-        setNeedsGesture(false);
+        setNeedsGesture(false); // keep overlay off so remote is visible
 
         // hydrate remotes
         logUsers(client, 'after-join');
@@ -625,7 +677,7 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
         </div>
       )}
 
-      {/* Optional gesture overlay (now ONLY if explicitly enabled) */}
+      {/* Optional gesture overlay */}
       {needsGesture && (
         <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,.45)' }}>
           <button onClick={handleEnable} style={{ padding: '10px 14px', borderRadius: 8, border: 0, background: '#1f8fff', color: '#fff', fontWeight: 600 }}>
