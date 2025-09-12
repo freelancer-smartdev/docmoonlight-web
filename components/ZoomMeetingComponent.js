@@ -690,7 +690,7 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
       }}>
         <strong style={{ letterSpacing: '.2px' }}>{locationName ? `Clinic – ${locationName}` : 'Clinic'}</strong>
 
-        {cams.length > 0 && (
+        {/* {cams.length > 0 && (
           <select
             value={camId}
             onChange={(e) => setCamId(e.target.value)}
@@ -703,7 +703,7 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
           >
             {cams.map((c) => (<option key={c.deviceId} value={c.deviceId}>{c.label || 'Camera'}</option>))}
           </select>
-        )}
+        )} */}
 
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
           <button onClick={toggleAudioJoin}
