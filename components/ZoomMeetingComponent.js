@@ -4,13 +4,13 @@ import axios from 'axios';
 import ZoomVideo from '@zoom/videosdk';
 
 const API_BASE = '/api';
-const BUILD = 'ZMC-v8.4-joinAudio+forcePlay-remote-attach-2025-09-12';
+const BUILD = 'ZMC-v8.6-audioJoin+subscribe+forcePlay+deepLogs-2025-09-12';
 
 const asArray = (x) => (Array.isArray(x) ? x : x ? [x] : []);
 const displayNameFor = (role, location) =>
   Number(role) === 1 ? `Doctor – ${location || ''}` : `Clinic – ${location || ''}`;
 
-/* ---------- utils ---------- */
+/* ---------------- utils ---------------- */
 function decodeJwtPayload(token) {
   try {
     const part = token.split('.')[1];
@@ -29,11 +29,13 @@ function decodeJwtPayload(token) {
 async function maybeAwait(v) { return (v && typeof v.then === 'function') ? await v : v; }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const niceErr = (e) =>
-  typeof e === 'string' ? e : JSON.stringify({ name: e?.name, message: e?.message, reason: e?.reason, code: e?.code });
+  typeof e === 'string'
+    ? e
+    : JSON.stringify({ name: e?.name, message: e?.message, reason: e?.reason, code: e?.code });
 
 function sizeOf(el) {
   const r = el?.getBoundingClientRect?.();
-  return { w: Math.max(0, Math.round(r?.width || 0)), h: Math.max(0, Math.round(r?.height || 0)) };
+  return { w: Math.round(r?.width || 0), h: Math.round(r?.height || 0) };
 }
 async function waitForNonZeroRect(el, label, dbg, timeoutMs = 1500, pollMs = 50) {
   const t0 = Date.now();
@@ -49,7 +51,7 @@ function b64EncodeUnicode(str) {
   return btoa(encodeURIComponent(str).replace(/%([0-9A-F]{2})/g, (_, p) => String.fromCharCode(parseInt(p, 16))));
 }
 
-/* ---------- env helpers ---------- */
+/* -------- env helpers for self-view -------- */
 function mustUseVideoElForSelf() {
   if (typeof window === 'undefined') return false;
   const ua = navigator.userAgent || '';
@@ -60,33 +62,28 @@ function mustUseVideoElForSelf() {
   return isiOS || ((isChromiumFamily || isAndroid) && !hasSAB);
 }
 
-/* ---------- global housekeeping ---------- */
+/* ------------ housekeeping ------------ */
 const liveIntervals = new Set();
 function safeInterval(fn, ms) { const id = setInterval(fn, ms); liveIntervals.add(id); return id; }
 function clearAllIntervals() { liveIntervals.forEach(clearInterval); liveIntervals.clear(); }
 
-/* ---------- small helpers ---------- */
+/* -------------- small helpers -------------- */
 function fillEl(el) {
   try { Object.assign(el.style, { position:'absolute', inset:0, width:'100%', height:'100%', display:'block' }); } catch {}
 }
-function forcePlay(el, dbg, uid) {
+function forcePlay(el, dbg, ctx) {
   try {
-    // If SDK gave us a real <video>, mute to satisfy autoplay and play().
-    if (el && el.tagName && el.tagName.toLowerCase() === 'video') {
-      el.muted = true;
-      const p = el.play?.();
-      p?.catch((e) => dbg('remote.play.video.catch', { uid, err: niceErr(e) }));
-    } else {
-      // SDK's <video-player> usually forwards play().
-      const p = el?.play?.();
-      p?.catch((e) => dbg('remote.play.player.catch', { uid, err: niceErr(e) }));
+    // Try to play() regardless of tag; Zoom's <video-player> forwards play()
+    const p = el?.play?.();
+    if (p && typeof p.catch === 'function') {
+      p.catch((e) => dbg('remote.play.catch', { ctx, err: niceErr(e) }));
     }
   } catch (e) {
-    dbg('remote.play.error', { uid, err: niceErr(e) });
+    dbg('remote.play.error', { ctx, err: niceErr(e) });
   }
 }
 
-/* ---------- REMOTE: canvas then attachVideo fallback ---------- */
+/* -------------- REMOTE: canvas then attachVideo -------------- */
 async function renderRemoteCanvas(stream, uid, slotDiv, dbg) {
   await waitForNonZeroRect(slotDiv, 'remote.slot.beforeRender', dbg, 2000, 60);
 
@@ -120,7 +117,7 @@ async function stopRemoteCanvas(stream, uid, slotDiv) {
   if (slotDiv?._ro) { try { slotDiv._ro.disconnect(); } catch {} delete slotDiv._ro; }
 }
 
-/** attachVideo with sizing + forcePlay + reattach if 0×0 */
+/** attachVideo with sizing + forcePlay + reattach if 0×0, with verbose logs */
 async function attachRemoteCompat(stream, uid, slotDiv, dbg, prefer = 'videoEl', attempt = 0) {
   const Q360 = (ZoomVideo?.VideoQuality?.Video_360P) ?? 2;
 
@@ -129,7 +126,7 @@ async function attachRemoteCompat(stream, uid, slotDiv, dbg, prefer = 'videoEl',
 
   const viaVideoEl = async () => {
     const v = document.createElement('video');
-    v.autoplay = true; v.playsInline = true; v.muted = true; // muted => autoplay OK
+    v.autoplay = true; v.playsInline = true; v.muted = true; // muted => autoplay ok
     Object.assign(v.style, { width:'100%', height:'100%', objectFit:'cover', display:'block', background:'#111' });
     slotDiv.textContent = '';
     slotDiv.appendChild(v);
@@ -155,20 +152,20 @@ async function attachRemoteCompat(stream, uid, slotDiv, dbg, prefer = 'videoEl',
     catch (e1) { dbg('remote.attach.videoEl.fail', { uid, err: niceErr(e1) }); el = await viaContainer(); dbg('remote.attach.container.ok', { uid, tag: el?.tagName?.toLowerCase?.() }); }
   }
 
-  // Force playback (autoplay gate)
-  forcePlay(el, dbg, uid);
+  // Try to kick playback (in case autoplay is still gated)
+  forcePlay(el, dbg, `uid:${uid}`);
 
-  // If element or slot ended 0×0, reattach with the alternate signature once
+  // Log concrete sizes and retry once if either rect is zero
   setTimeout(async () => {
     try {
       const er = sizeOf(el), sr = sizeOf(slotDiv);
-      dbg('remote.postcheck', { uid, el: { tag: el?.tagName?.toLowerCase?.(), ...er }, slot: sr, attempt, prefer });
+      dbg('remote.postcheck', { uid, elTag: el?.tagName?.toLowerCase?.(), elW: er.w, elH: er.h, slotW: sr.w, slotH: sr.h, attempt, prefer });
 
       if ((er.w === 0 || er.h === 0 || sr.w === 0 || sr.h === 0) && attempt < 1) {
         try { await maybeAwait(stream.detachVideo?.(uid)); } catch {}
         await waitForNonZeroRect(slotDiv, 'remote.slot.beforeReattach', dbg, 1200, 60);
         const el2 = await attachRemoteCompat(stream, uid, slotDiv, dbg, prefer === 'videoEl' ? 'container' : 'videoEl', attempt+1);
-        dbg('remote.postcheck.reattach.ok', { uid, tag: el2?.tagName?.toLowerCase?.() });
+        dbg('remote.postcheck.reattach.ok', { uid, tag: el2?.tagName?.toLowerCase?.(), prefer });
       }
     } catch (e) {
       dbg('remote.postcheck.error', { uid, err: niceErr(e) });
@@ -178,11 +175,7 @@ async function attachRemoteCompat(stream, uid, slotDiv, dbg, prefer = 'videoEl',
   return el;
 }
 
-async function detachRemoteCompat(stream, uid) {
-  try { await maybeAwait(stream.detachVideo?.(uid)); } catch {}
-}
-
-/* ---------- COMPONENT ---------- */
+/* -------------- COMPONENT -------------- */
 export default function ZoomMeetingComponent({ callId, locationName, role = 0, userId, token }) {
   const clientRef = useRef(null);
   const mediaRef  = useRef(null);
@@ -195,13 +188,13 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
   const selfModeRef = useRef('auto'); // 'canvas' | 'video'
   const [selfMode, setSelfMode] = useState('auto');
 
-  // remotes map: uid -> { wrapper, slot, label, mode: 'canvas' | 'attach', node?:HTMLElement }
+  // remotes: uid -> { wrapper, slot, label, mode: 'canvas' | 'attach', node?:HTMLElement }
   const remoteTilesRef = useRef(new Map());
   const remoteGridRef  = useRef(null);
 
   const [joining, setJoining] = useState(true);
   const [error, setError]     = useState('');
-  const [audioOn, setAudioOn] = useState(false); // joined speaker (not mic publish)
+  const [audioOn, setAudioOn] = useState(false);
   const [camOn, setCamOn]     = useState(false);
 
   const isiOS = typeof navigator !== 'undefined' && /iPhone|iPad|iPod/i.test(navigator.userAgent);
@@ -304,7 +297,11 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
         return;
       }
 
-      // Try canvas, then fallback to attachVideo
+      // Explicit subscribe if API exists (some SDK builds require for attachVideo-on-certain-envs)
+      try { await maybeAwait(stream.subscribeVideo?.(uid)); dbg('remote.subscribe.ok', { uid }); } 
+      catch (eSub) { dbg('remote.subscribe.fail', { uid, err: niceErr(eSub) }); }
+
+      // Try canvas first (fast path on desktop), otherwise attachVideo
       try {
         const canvas = await renderRemoteCanvas(stream, uid, tile.slot, dbg);
         tile.mode = 'canvas';
@@ -319,8 +316,8 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
           tile.node = el;
           dbg('remote.mode.attach', { uid, tag: el?.tagName?.toLowerCase?.() });
 
-          // ensure playback on visibility regain (if Chrome blocked autoplay earlier)
-          const onVis = () => { if (!document.hidden) forcePlay(el, dbg, uid); };
+          // Retry play() on visibility regain (Chrome sometimes unblocks later)
+          const onVis = () => { if (!document.hidden) forcePlay(el, dbg, `uid:${uid}/vis`); };
           document.addEventListener('visibilitychange', onVis);
           tile._onVis = onVis;
 
@@ -343,8 +340,9 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
     try {
       if (tile._onVis) { document.removeEventListener('visibilitychange', tile._onVis); delete tile._onVis; }
       if (tile.mode === 'canvas') await stopRemoteCanvas(stream, uid, tile.slot);
-      else if (tile.mode === 'attach') await detachRemoteCompat(stream, uid);
+      else if (tile.mode === 'attach') await maybeAwait(stream.detachVideo?.(uid));
     } catch {}
+    try { await maybeAwait(stream.unsubscribeVideo?.(uid)); } catch {}
   }
 
   async function removeRemoteTile(uid) {
@@ -413,24 +411,27 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
 
         const meId = client.getCurrentUserInfo()?.userId;
         dbg('session', { sessionName, meId, platform: navigator.platform, ua: navigator.userAgent });
+
         if (selfLabelRef.current) selfLabelRef.current.textContent = `You — ${myDisplayName}`;
 
         // media
         const media = client.getMediaStream();
         mediaRef.current = media;
 
+        // Audio join immediately (unlocks autoplay for remote video elements)
+        try { await media.startAudio(); setAudioOn(true); dbg('audio.start.ok'); }
+        catch (e) { dbg('audio.start.fail', { err: niceErr(e) }); }
+
+        // camera list
         try {
           const list = await maybeAwait(media.getCameraList?.());
           if (Array.isArray(list) && list.length) { setCams(list); setCamId((prev) => prev || list[0]?.deviceId || ''); }
-        } catch {}
-
-        // Immediately join audio (speaker) to unlock autoplay for remote <video-player>
-        try { await media.startAudio(); setAudioOn(true); } catch (e) { dbg('audio.start.fail', { err: niceErr(e) }); }
+        } catch (e) { dbg('camera.list.fail', { err: niceErr(e) }); }
 
         setNeedsGesture(isiOS);
         setCamOn(false);
 
-        // hydrate remotes
+        // hydrate remotes already in the room
         logUsers(client, 'after-join');
         (client.getAllUser() || []).forEach((u) => {
           if (u.userId !== meId) {
@@ -475,6 +476,7 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
         client.on('peer-video-state-change', onPeerVideo);
         clientRef.current._handlers = { onAdded, onUpdated, onRemoved, onPeerVideo };
 
+        // debug heartbeat
         safeInterval(() => {
           try {
             const me = client.getCurrentUserInfo();
@@ -489,7 +491,6 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
         console.error('raw error:', e);
         if (e?.response) { console.error('HTTP status:', e.response.status); console.error('HTTP data:', e.response.data); }
         console.groupEnd?.();
-
         if (!mounted) return;
         setError(e?.response?.data?.error || e?.response?.data?.message || e?.reason || e?.message || 'Failed to join session');
         setJoining(false);
@@ -515,8 +516,9 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
           try {
             if (tile._onVis) { document.removeEventListener('visibilitychange', tile._onVis); }
             if (tile.mode === 'canvas') await stopRemoteCanvas(media, uid, tile.slot);
-            else if (tile.mode === 'attach') await detachRemoteCompat(media, uid);
+            else if (tile.mode === 'attach') await maybeAwait(media.detachVideo?.(uid));
           } catch {}
+          try { await maybeAwait(media.unsubscribeVideo?.(uid)); } catch {}
         });
         remoteTilesRef.current.clear();
       } catch {}
@@ -620,7 +622,7 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
   }, [camId, camOn]);
   const toggleCam = async () => (camOn ? stopCam() : startCam());
 
-  /* ---- Audio join toggle (speaker) ---- */
+  /* ---- Audio (speaker) join toggle ---- */
   const toggleAudioJoin = async () => {
     const media = mediaRef.current;
     if (!media) return;
@@ -634,7 +636,7 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
 
   const handleEnable = async () => {
     setNeedsGesture(false);
-    try { await maybeAwait(mediaRef.current?.startAudio()); setAudioOn(true); } catch {}
+    try { await maybeAwait(mediaRef.current?.startAudio()); setAudioOn(true); dbg('gesture.audio.ok'); } catch (e) { dbg('gesture.audio.fail', { err: niceErr(e) }); }
     try { await startCam(); } catch {}
   };
 
@@ -668,7 +670,7 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
         </div>
       </div>
 
-      {/* Main content: 2 columns on desktop, stacked on mobile */}
+      {/* Main content */}
       <div style={{
         display: 'grid',
         gridTemplateColumns: isNarrow ? '1fr' : 'minmax(280px,360px) 1fr',
