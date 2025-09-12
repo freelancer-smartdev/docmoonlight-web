@@ -4,7 +4,7 @@ import axios from 'axios';
 import ZoomVideo from '@zoom/videosdk';
 
 const API_BASE = '/api';
-const BUILD = 'ZMC-v8.6-audioJoin+subscribe+forcePlay+deepLogs-2025-09-12';
+const BUILD = 'ZMC-v8.7-appendReturnedPlayer+2argAttach+vpCSS-2025-09-12';
 
 const asArray = (x) => (Array.isArray(x) ? x : x ? [x] : []);
 const displayNameFor = (role, location) =>
@@ -73,7 +73,6 @@ function fillEl(el) {
 }
 function forcePlay(el, dbg, ctx) {
   try {
-    // Try to play() regardless of tag; Zoom's <video-player> forwards play()
     const p = el?.play?.();
     if (p && typeof p.catch === 'function') {
       p.catch((e) => dbg('remote.play.catch', { ctx, err: niceErr(e) }));
@@ -81,6 +80,20 @@ function forcePlay(el, dbg, ctx) {
   } catch (e) {
     dbg('remote.play.error', { ctx, err: niceErr(e) });
   }
+}
+
+/* ---------- inject CSS for Zoom's custom element ---------- */
+function ensureVideoPlayerCSS() {
+  if (typeof document === 'undefined') return;
+  if (document.getElementById('zmc-videoplayer-css')) return;
+  const style = document.createElement('style');
+  style.id = 'zmc-videoplayer-css';
+  style.textContent = `
+    video-player, .video-player, video-player-container {
+      display: block !important; width: 100% !important; height: 100% !important;
+    }
+  `;
+  document.head.appendChild(style);
 }
 
 /* -------------- REMOTE: canvas then attachVideo -------------- */
@@ -117,7 +130,7 @@ async function stopRemoteCanvas(stream, uid, slotDiv) {
   if (slotDiv?._ro) { try { slotDiv._ro.disconnect(); } catch {} delete slotDiv._ro; }
 }
 
-/** attachVideo with sizing + forcePlay + reattach if 0×0, with verbose logs */
+/** attachVideo — ALWAYS append returned element; also support (uid, quality) form */
 async function attachRemoteCompat(stream, uid, slotDiv, dbg, prefer = 'videoEl', attempt = 0) {
   const Q360 = (ZoomVideo?.VideoQuality?.Video_360P) ?? 2;
 
@@ -125,47 +138,70 @@ async function attachRemoteCompat(stream, uid, slotDiv, dbg, prefer = 'videoEl',
   await waitForNonZeroRect(slotDiv, 'remote.slot.beforeAttach', dbg, 2000, 60);
 
   const viaVideoEl = async () => {
-    const v = document.createElement('video');
-    v.autoplay = true; v.playsInline = true; v.muted = true; // muted => autoplay ok
-    Object.assign(v.style, { width:'100%', height:'100%', objectFit:'cover', display:'block', background:'#111' });
+    // create a placeholder <video>, but replace with returned <video-player> if SDK gives us one
+    const ph = document.createElement('video');
+    ph.autoplay = true; ph.playsInline = true; ph.muted = true;
+    Object.assign(ph.style, { width:'100%', height:'100%', objectFit:'cover', display:'block', background:'#111' });
+
     slotDiv.textContent = '';
-    slotDiv.appendChild(v);
-    const ret = await maybeAwait(stream.attachVideo(uid, v));
-    const el = (ret && ret.nodeType === 1) ? ret : v;
-    if (el !== slotDiv) fillEl(el);
+    slotDiv.appendChild(ph);
+
+    const ret = await maybeAwait(stream.attachVideo(uid, ph));
+    const el = (ret && ret.nodeType === 1) ? ret : ph;
+
+    // If SDK returned a different element (e.g., <video-player>), append it and remove the placeholder.
+    if (el !== ph) {
+      dbg('remote.attach.videoEl.returnedNew', { uid, tag: el?.tagName?.toLowerCase?.() });
+      try { ph.remove(); } catch {}
+      slotDiv.appendChild(el);
+    } else {
+      dbg('remote.attach.videoEl.usedPlaceholder', { uid });
+    }
+
+    if (!el.isConnected) { slotDiv.appendChild(el); dbg('remote.attach.videoEl.appendedManually', { uid }); }
+    fillEl(el);
+    // extra safety — some builds need explicit width/height on the custom element
+    try { el.style.width = '100%'; el.style.height = '100%'; el.style.display = 'block'; } catch {}
     return el;
   };
-  const viaContainer = async () => {
+
+  const viaQuality2Arg = async () => {
+    // attachVideo(userId, quality) -> returns an element that YOU must append to DOM
+    const ret = await maybeAwait(stream.attachVideo(uid, Q360));
+    if (!ret || ret.nodeType !== 1) throw new Error('attachVideo(2-arg) did not return an element');
+    const el = ret;
     slotDiv.textContent = '';
-    const ret = await maybeAwait(stream.attachVideo(uid, Q360, slotDiv));
-    const el = (ret && ret.nodeType === 1) ? ret : (slotDiv.firstElementChild || slotDiv);
-    if (el !== slotDiv) fillEl(el);
+    slotDiv.appendChild(el);
+    fillEl(el);
+    try { el.style.width = '100%'; el.style.height = '100%'; el.style.display = 'block'; } catch {}
+    dbg('remote.attach.2arg.ok', { uid, tag: el?.tagName?.toLowerCase?.() });
     return el;
   };
 
   let el = null;
-  if (prefer === 'container') {
-    try { el = await viaContainer(); dbg('remote.attach.container.ok', { uid, tag: el?.tagName?.toLowerCase?.() }); }
-    catch (e1) { dbg('remote.attach.container.fail', { uid, err: niceErr(e1) }); el = await viaVideoEl(); dbg('remote.attach.videoEl.ok', { uid, tag: el?.tagName?.toLowerCase?.() }); }
+  if (prefer === 'quality') {
+    try { el = await viaQuality2Arg(); }
+    catch (e1) { dbg('remote.attach.2arg.fail', { uid, err: niceErr(e1) }); el = await viaVideoEl(); dbg('remote.attach.videoEl.ok', { uid, tag: el?.tagName?.toLowerCase?.() }); }
   } else {
     try { el = await viaVideoEl(); dbg('remote.attach.videoEl.ok', { uid, tag: el?.tagName?.toLowerCase?.() }); }
-    catch (e1) { dbg('remote.attach.videoEl.fail', { uid, err: niceErr(e1) }); el = await viaContainer(); dbg('remote.attach.container.ok', { uid, tag: el?.tagName?.toLowerCase?.() }); }
+    catch (e1) { dbg('remote.attach.videoEl.fail', { uid, err: niceErr(e1) }); el = await viaQuality2Arg(); }
   }
 
-  // Try to kick playback (in case autoplay is still gated)
+  // Kick playback (autoplay gate)
   forcePlay(el, dbg, `uid:${uid}`);
 
-  // Log concrete sizes and retry once if either rect is zero
+  // Post-check sizes and retry once with the alt signature if el is 0×0
   setTimeout(async () => {
     try {
       const er = sizeOf(el), sr = sizeOf(slotDiv);
       dbg('remote.postcheck', { uid, elTag: el?.tagName?.toLowerCase?.(), elW: er.w, elH: er.h, slotW: sr.w, slotH: sr.h, attempt, prefer });
 
-      if ((er.w === 0 || er.h === 0 || sr.w === 0 || sr.h === 0) && attempt < 1) {
+      if ((er.w === 0 || er.h === 0) && attempt < 1) {
         try { await maybeAwait(stream.detachVideo?.(uid)); } catch {}
         await waitForNonZeroRect(slotDiv, 'remote.slot.beforeReattach', dbg, 1200, 60);
-        const el2 = await attachRemoteCompat(stream, uid, slotDiv, dbg, prefer === 'videoEl' ? 'container' : 'videoEl', attempt+1);
-        dbg('remote.postcheck.reattach.ok', { uid, tag: el2?.tagName?.toLowerCase?.(), prefer });
+        const altPrefer = (prefer === 'videoEl') ? 'quality' : 'videoEl';
+        const el2 = await attachRemoteCompat(stream, uid, slotDiv, dbg, altPrefer, attempt+1);
+        dbg('remote.postcheck.reattach.ok', { uid, tag: el2?.tagName?.toLowerCase?.(), prefer: altPrefer });
       }
     } catch (e) {
       dbg('remote.postcheck.error', { uid, err: niceErr(e) });
@@ -223,6 +259,7 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
         hasSAB: 'SharedArrayBuffer' in window,
         ua: navigator.userAgent,
       });
+      ensureVideoPlayerCSS();
     }
   }, []);
   const dbg = (msg, data) => {
@@ -297,11 +334,11 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
         return;
       }
 
-      // Explicit subscribe if API exists (some SDK builds require for attachVideo-on-certain-envs)
+      // Explicit subscribe if available
       try { await maybeAwait(stream.subscribeVideo?.(uid)); dbg('remote.subscribe.ok', { uid }); } 
       catch (eSub) { dbg('remote.subscribe.fail', { uid, err: niceErr(eSub) }); }
 
-      // Try canvas first (fast path on desktop), otherwise attachVideo
+      // Try canvas first, fallback to attachVideo
       try {
         const canvas = await renderRemoteCanvas(stream, uid, tile.slot, dbg);
         tile.mode = 'canvas';
@@ -316,7 +353,6 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
           tile.node = el;
           dbg('remote.mode.attach', { uid, tag: el?.tagName?.toLowerCase?.() });
 
-          // Retry play() on visibility regain (Chrome sometimes unblocks later)
           const onVis = () => { if (!document.hidden) forcePlay(el, dbg, `uid:${uid}/vis`); };
           document.addEventListener('visibilitychange', onVis);
           tile._onVis = onVis;
@@ -484,14 +520,12 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
           } catch {}
         }, 3000);
 
-        if (!mounted) return;
         setJoining(false);
       } catch (e) {
         console.group('[VideoSDK][join] failed');
         console.error('raw error:', e);
         if (e?.response) { console.error('HTTP status:', e.response.status); console.error('HTTP data:', e.response.data); }
         console.groupEnd?.();
-        if (!mounted) return;
         setError(e?.response?.data?.error || e?.response?.data?.message || e?.reason || e?.message || 'Failed to join session');
         setJoining(false);
       }
