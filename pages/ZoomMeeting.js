@@ -49,7 +49,6 @@ export default function ZoomMeeting() {
     <div style={{ height: '100vh', width: '100vw', background: '#000' }}>
       <Head>
         <title>Video Session</title>
-        {/* Ensure correct mobile layout & safe area */}
         <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
       </Head>
       <ZoomMeetingComponent

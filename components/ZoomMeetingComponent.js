@@ -4,7 +4,7 @@ import axios from 'axios';
 import ZoomVideo from '@zoom/videosdk';
 
 const API_BASE = '/api';
-const BUILD = 'ZMC-v8.9-subscribeThenAttach+forcePixelSize+tripleRetry+postGestureKick-2025-09-12';
+const BUILD = 'ZMC-v9.0-mobileAttachOnly+subscribeFirst+vpFix+toolbarClamp-2025-09-12';
 
 const asArray = (x) => (Array.isArray(x) ? x : x ? [x] : []);
 const displayNameFor = (role, location) =>
@@ -37,7 +37,7 @@ function sizeOf(el) {
   const r = el?.getBoundingClientRect?.();
   return { w: Math.round(r?.width || 0), h: Math.round(r?.height || 0) };
 }
-async function waitForNonZeroRect(el, label, dbg, timeoutMs = 1500, pollMs = 50) {
+async function waitForNonZeroRect(el, label, dbg, timeoutMs = 1600, pollMs = 60) {
   const t0 = Date.now();
   let r = sizeOf(el);
   while ((r.w === 0 || r.h === 0) && Date.now() - t0 < timeoutMs) {
@@ -50,51 +50,25 @@ async function waitForNonZeroRect(el, label, dbg, timeoutMs = 1500, pollMs = 50)
 function b64EncodeUnicode(str) {
   return btoa(encodeURIComponent(str).replace(/%([0-9A-F]{2})/g, (_, p) => String.fromCharCode(parseInt(p, 16))));
 }
-function px(el) {
-  const { w, h } = sizeOf(el);
-  return { w: Math.max(1, w), h: Math.max(1, h) };
-}
 
 /* -------- env helpers -------- */
+function isMobile() {
+  if (typeof navigator === 'undefined') return false;
+  return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || '');
+}
+function hasSAB() {
+  return typeof window !== 'undefined' && 'SharedArrayBuffer' in window && window.crossOriginIsolated === true;
+}
 function mustUseVideoElForSelf() {
   if (typeof window === 'undefined') return false;
   const ua = navigator.userAgent || '';
   const isiOS = /iPhone|iPad|iPod/i.test(ua);
   const isChromiumFamily = /(Chrome|Chromium|Edg)\//i.test(ua) && !/OPR\//i.test(ua);
   const isAndroid = /Android/i.test(ua);
-  const hasSAB = 'SharedArrayBuffer' in window && window.crossOriginIsolated === true;
-  return isiOS || ((isChromiumFamily || isAndroid) && !hasSAB);
-}
-function preferAttachForRemotes() {
-  if (typeof window === 'undefined') return false;
-  const ua = navigator.userAgent || '';
-  const isiOS = /iPhone|iPad|iPod/i.test(ua);
-  const isAndroid = /Android/i.test(ua);
-  const hasSAB = 'SharedArrayBuffer' in window && window.crossOriginIsolated === true;
-  return isiOS || (isAndroid && !hasSAB);
+  return isiOS || ((isChromiumFamily || isAndroid) && !hasSAB());
 }
 
-/* ------------ housekeeping ------------ */
-const liveIntervals = new Set();
-function safeInterval(fn, ms) { const id = setInterval(fn, ms); liveIntervals.add(id); return id; }
-function clearAllIntervals() { liveIntervals.forEach(clearInterval); liveIntervals.clear(); }
-
-/* -------------- small helpers -------------- */
-function fillAbs(el) {
-  try { Object.assign(el.style, { position:'absolute', inset:0, width:'100%', height:'100%', display:'block' }); } catch {}
-}
-function forcePlay(el, dbg, ctx) {
-  try {
-    const p = el?.play?.();
-    if (p && typeof p.catch === 'function') {
-      p.catch((e) => dbg('remote.play.catch', { ctx, err: niceErr(e) }));
-    }
-  } catch (e) {
-    dbg('remote.play.error', { ctx, err: niceErr(e) });
-  }
-}
-
-/* ---------- CSS for Zoom's custom element ---------- */
+/* ---------- inject CSS for Zoom’s custom element ---------- */
 function ensureVideoPlayerCSS() {
   if (typeof document === 'undefined') return;
   if (document.getElementById('zmc-videoplayer-css')) return;
@@ -108,71 +82,134 @@ function ensureVideoPlayerCSS() {
   document.head.appendChild(style);
 }
 
-/* -------------- REMOTE: attachVideo with retries -------------- */
-async function attachRemote(stream, uid, slot, dbg, attempt = 0) {
-  // 1) subscribe first (some builds require it *before* attach)
+/* ---------- helpers ---------- */
+function fill(el) {
+  try { Object.assign(el.style, { position:'absolute', inset:0, width:'100%', height:'100%', display:'block' }); } catch {}
+}
+function forcePlay(el, dbg, ctx) {
+  try {
+    const p = el?.play?.();
+    if (p && typeof p.catch === 'function') p.catch((e)=>dbg('video.play.catch',{ctx,err:niceErr(e)}));
+  } catch (e) { dbg('video.play.error',{ctx,err:niceErr(e)}); }
+}
+
+/* ---------- REMOTE attach (mobile = attach only) ---------- */
+async function attachRemote(stream, uid, slotDiv, dbg, attempt = 0) {
+  // Always attach on mobile-no-SAB; canvas isn’t supported there.
+  const preferAttachOnly = isMobile() && !hasSAB();
+
+  // Give the slot a real box (no percentage-height chain)
+  Object.assign(slotDiv.style, {
+    position: 'relative',
+    background: '#111',
+    aspectRatio: '16 / 9',
+    minHeight: '180px'
+  });
+
+  await waitForNonZeroRect(slotDiv, 'remote.slot.beforeAttach', dbg);
+
+  // Always subscribe first (safe even if already subscribed)
   try { await maybeAwait(stream.subscribeVideo?.(uid)); dbg('remote.subscribe.ok', { uid }); }
   catch (e) { dbg('remote.subscribe.fail', { uid, err: niceErr(e) }); }
 
-  await waitForNonZeroRect(slot, 'remote.slot.beforeAttach', dbg, 2000, 60);
+  // Variant A: attachVideo(userId, videoEl?) → may return <video-player>
+  const attachViaVideoEl = async () => {
+    const placeholder = document.createElement('video');
+    placeholder.autoplay = true; placeholder.playsInline = true; placeholder.muted = true;
+    Object.assign(placeholder.style, { width:'100%', height:'100%', objectFit:'cover', display:'block', background:'#111' });
 
-  // 2) attach into a placeholder <video>; SDK might return <video-player>
-  const ph = document.createElement('video');
-  ph.autoplay = true; ph.playsInline = true; ph.muted = true;
-  Object.assign(ph.style, { width:'100%', height:'100%', objectFit:'cover', display:'block', background:'#111' });
-  slot.textContent = '';
-  slot.appendChild(ph);
+    slotDiv.textContent = '';
+    slotDiv.appendChild(placeholder);
 
-  let el;
-  try {
-    const ret = await maybeAwait(stream.attachVideo(uid, ph));
-    el = (ret && ret.nodeType === 1) ? ret : ph;
-    if (el !== ph) { try { ph.remove(); } catch {} slot.appendChild(el); }
-    fillAbs(el);
-    // Force concrete px size immediately (not only %)
-    const { w, h } = px(slot);
-    try { el.style.width = `${w}px`; el.style.height = `${h}px`; } catch {}
-    // And then fall back to 100% after a raf to allow the player to size itself
-    requestAnimationFrame(() => {
-      try { el.style.width = '100%'; el.style.height = '100%'; } catch {}
-    });
-    dbg('remote.attach.ok', { uid, tag: el.tagName?.toLowerCase?.() });
-  } catch (e) {
-    dbg('remote.attach.err', { uid, err: niceErr(e) });
-    throw e;
+    const ret = await maybeAwait(stream.attachVideo(uid, placeholder));
+    const el = (ret && ret.nodeType === 1) ? ret : placeholder;
+
+    if (el !== placeholder) {
+      try { placeholder.remove(); } catch {}
+      slotDiv.appendChild(el);
+    }
+    fill(el);
+    try { el.style.width = '100%'; el.style.height = '100%'; el.style.display = 'block'; } catch {}
+    dbg('remote.attach.ok', { uid, tag: el?.tagName?.toLowerCase?.() || 'video' });
+    forcePlay(el, dbg, `uid:${uid}`);
+    return el;
+  };
+
+  // Variant B (only if desktop or SAB): render on canvas for best performance
+  const renderViaCanvas = async () => {
+    const canvas = document.createElement('canvas');
+    Object.assign(canvas.style, { width:'100%', height:'100%', display:'block', background:'#111' });
+    slotDiv.textContent = '';
+    slotDiv.appendChild(canvas);
+
+    const { w, h } = sizeOf(slotDiv);
+    await maybeAwait(stream.renderVideo(canvas, uid, Math.max(1,w), Math.max(1,h), 0, 0, 2));
+    dbg('remote.render.canvas.ok', { uid, w, h });
+
+    if (!slotDiv._ro) {
+      const ro = new ResizeObserver(async () => {
+        const { w: w2, h: h2 } = sizeOf(slotDiv);
+        try { await maybeAwait(stream.updateVideoCanvasDimension(canvas, uid, Math.max(1,w2), Math.max(1,h2))); }
+        catch(e){ dbg('remote.render.resize.fail',{uid,err:niceErr(e)}); }
+      });
+      ro.observe(slotDiv);
+      slotDiv._ro = ro;
+    }
+    return canvas;
+  };
+
+  // Choose path
+  let node = null;
+  if (preferAttachOnly) {
+    node = await attachViaVideoEl();
+  } else {
+    try { node = await renderViaCanvas(); }
+    catch (e1) {
+      dbg('remote.render.fail', { uid, err: niceErr(e1) });
+      node = await attachViaVideoEl();
+    }
   }
 
-  // 3) poke autoplay + layout
-  forcePlay(el, dbg, `uid:${uid}/attach`);
-  setTimeout(() => { try { window.dispatchEvent(new Event('resize')); } catch {} }, 0);
-
-  // 4) post-check and up to 3 retries swapping element
+  // Post-check: if the returned element is 0×0, retry attach up to 3 times
   setTimeout(async () => {
-    const { w: ew, h: eh } = sizeOf(el);
-    const { w: sw, h: sh } = sizeOf(slot);
-    dbg('remote.postcheck', { uid, elTag: el.tagName?.toLowerCase?.(), elW: ew, elH: eh, slotW: sw, slotH: sh, attempt });
-
-    if ((ew === 0 || eh === 0) && attempt < 3) {
-      try { await maybeAwait(stream.detachVideo?.(uid)); } catch {}
-      // force px again on next attempt
-      await attachRemote(stream, uid, slot, dbg, attempt + 1);
-      dbg('remote.postcheck.retry', { uid, attempt: attempt + 1 });
+    try {
+      const rEl = sizeOf(node), rSlot = sizeOf(slotDiv);
+      dbg('remote.postcheck', { uid, elW: rEl.w, elH: rEl.h, slotW: rSlot.w, slotH: rSlot.h, attempt });
+      if ((rEl.w === 0 || rEl.h === 0) && attempt < 3) {
+        try { await maybeAwait(stream.detachVideo?.(uid)); } catch {}
+        await waitForNonZeroRect(slotDiv, 'remote.slot.reattach.wait', dbg);
+        const again = await attachRemote(stream, uid, slotDiv, dbg, attempt + 1);
+        dbg('remote.postcheck.reattach.ok', { uid, attempt: attempt + 1, tag: again?.tagName?.toLowerCase?.() });
+      }
+    } catch (e) {
+      dbg('remote.postcheck.error', { uid, err: niceErr(e) });
     }
   }, 400);
 
-  // keep a periodic nudge for stubborn devices
-  const tick = setInterval(() => {
-    const { w: ew, h: eh } = sizeOf(el);
-    if (ew === 0 || eh === 0) {
-      const { w, h } = px(slot);
-      try { el.style.width = `${w}px`; el.style.height = `${h}px`; } catch {}
-      forcePlay(el, dbg, `uid:${uid}/tick`);
-      try { window.dispatchEvent(new Event('resize')); } catch {}
-      dbg('remote.tick.nudge', { uid, w, h });
-    } else {
-      clearInterval(tick);
+  // Kick again when tab becomes visible
+  const onVis = () => { if (!document.hidden) forcePlay(node, dbg, `uid:${uid}/vis`); };
+  document.addEventListener('visibilitychange', onVis);
+  node._onVis = onVis;
+
+  return { node, mode: node?.tagName?.toLowerCase?.() === 'canvas' ? 'canvas' : 'attach' };
+}
+
+async function stopRemote(stream, uid, tile, dbg) {
+  try {
+    if (tile?.node?._onVis) {
+      document.removeEventListener('visibilitychange', tile.node._onVis);
+      delete tile.node._onVis;
     }
-  }, 1500);
+    if (tile?.mode === 'canvas') {
+      const canvas = tile.node;
+      try { await maybeAwait(stream.stopRenderVideo(canvas, uid)); } catch {}
+      if (tile.slot?._ro) { try { tile.slot._ro.disconnect(); } catch {} delete tile.slot._ro; }
+    } else {
+      try { await maybeAwait(stream.detachVideo?.(uid)); } catch {}
+    }
+  } finally {
+    try { await maybeAwait(stream.unsubscribeVideo?.(uid)); } catch {}
+  }
 }
 
 /* -------------- COMPONENT -------------- */
@@ -180,15 +217,15 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
   const clientRef = useRef(null);
   const mediaRef  = useRef(null);
 
-  // self (hybrid)
+  // self
   const selfCanvasRef = useRef(null);
   const selfVideoRef  = useRef(null);
   const selfContainerRef = useRef(null);
   const selfLabelRef = useRef(null);
-  const selfModeRef = useRef('auto'); // 'canvas' | 'video'
+  const selfModeRef = useRef('auto');
   const [selfMode, setSelfMode] = useState('auto');
 
-  // remotes: uid -> { wrapper, slot, label }
+  // remotes: uid -> { wrapper, slot, label, mode, node }
   const remoteTilesRef = useRef(new Map());
   const remoteGridRef  = useRef(null);
 
@@ -197,7 +234,7 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
   const [audioOn, setAudioOn] = useState(false);
   const [camOn, setCamOn]     = useState(false);
 
-  const isiOS = typeof navigator !== 'undefined' && /iPhone|iPad|iPod/i.test(navigator.userAgent);
+  const isiOS = typeof navigator !== 'undefined' && /iPhone|iPad|iPod/i.test(navigator.userAgent || '');
   const [needsGesture, setNeedsGesture] = useState(false);
 
   const [cams, setCams] = useState([]);
@@ -274,7 +311,7 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
     wrapper.appendChild(label);
     remoteGridRef.current?.appendChild(wrapper);
 
-    const tileObj = { wrapper, slot, label };
+    const tileObj = { wrapper, slot, label, mode: null, node: null };
     remoteTilesRef.current.set(uid, tileObj);
     return tileObj;
   };
@@ -295,12 +332,12 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
       if (!client || !stream) return;
 
       const meId = client.getCurrentUserInfo()?.userId;
-      if (uid === meId) { dbg('remote.skip-self', { uid }); return; }
+      if (uid === meId) return;
 
       const user = (client.getAllUser() || []).find((u) => u.userId === uid) || { userId: uid };
       const tile = ensureRemoteTile(user);
 
-      await waitForNonZeroRect(tile.slot, 'tile.slot.beforeShow', dbg, 1600, 60);
+      await waitForNonZeroRect(tile.slot, 'tile.slot.beforeShow', dbg);
 
       if (!user.bVideoOn) {
         if (attempt < 8) { dbg('remote.wait-video', { uid, attempt }); await sleep(200); return showRemote(uid, attempt + 1); }
@@ -308,8 +345,10 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
         return;
       }
 
-      // Attach (mobile-first) with retries and pixel sizing
-      await attachRemote(stream, uid, tile.slot, dbg, 0);
+      const { node, mode } = await attachRemote(stream, uid, tile.slot, dbg, 0);
+      tile.node = node; tile.mode = mode;
+      dbg('remote.mode', { uid, mode });
+
     } catch (e) {
       dbg('remote.show.unhandled', { uid, err: niceErr(e) });
       if (attempt < 6) { await sleep(260); return showRemote(uid, attempt + 1); }
@@ -318,9 +357,11 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
 
   async function hideRemote(uid) {
     const stream = mediaRef.current;
-    try { await maybeAwait(stream.detachVideo?.(uid)); } catch {}
-    try { await maybeAwait(stream.unsubscribeVideo?.(uid)); } catch {}
+    const tile = remoteTilesRef.current.get(uid);
+    if (!tile || !stream) return;
+    await stopRemote(stream, uid, tile, dbg);
   }
+
   async function removeRemoteTile(uid) {
     await hideRemote(uid);
     const tile = remoteTilesRef.current.get(uid);
@@ -333,6 +374,8 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
     if (!callId && !token) return;
     if (joinedRef.current) return;
     joinedRef.current = true;
+
+    let mounted = true;
 
     (async () => {
       try {
@@ -376,7 +419,6 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
           myDisplayName = p?.user_identity || payload.userName;
         }
 
-        // init/join
         const client = ZoomVideo.createClient();
         clientRef.current = client;
 
@@ -385,13 +427,13 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
 
         const meId = client.getCurrentUserInfo()?.userId;
         dbg('session', { sessionName, meId, platform: navigator.platform, ua: navigator.userAgent });
+
         if (selfLabelRef.current) selfLabelRef.current.textContent = `You — ${myDisplayName}`;
 
-        // media
         const media = client.getMediaStream();
         mediaRef.current = media;
 
-        // Audio join immediately (helps autoplay)
+        // Join audio immediately (unlocks autoplay for remote players)
         try { await media.startAudio(); setAudioOn(true); dbg('audio.start.ok'); }
         catch (e) { dbg('audio.start.fail', { err: niceErr(e) }); }
 
@@ -404,7 +446,7 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
         setNeedsGesture(isiOS);
         setCamOn(false);
 
-        // existing users
+        // hydrate remotes already in the room
         logUsers(client, 'after-join');
         (client.getAllUser() || []).forEach((u) => {
           if (u.userId !== meId) {
@@ -449,8 +491,8 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
         client.on('peer-video-state-change', onPeerVideo);
         clientRef.current._handlers = { onAdded, onUpdated, onRemoved, onPeerVideo };
 
-        // tiny heartbeat to keep sizing fresh
-        safeInterval(() => {
+        // debug heartbeat
+        setInterval(() => {
           try {
             const me = client.getCurrentUserInfo();
             dbg('rect.tick', { me: me?.userId, tiles: Array.from(remoteTilesRef.current.keys()) });
@@ -483,17 +525,22 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
       } catch {}
 
       try {
-        remoteTilesRef.current.forEach(async (_, uid) => {
-          try { await maybeAwait(media?.detachVideo?.(uid)); } catch {}
-          try { await maybeAwait(media?.unsubscribeVideo?.(uid)); } catch {}
+        remoteTilesRef.current.forEach(async (tile, uid) => {
+          try { await stopRemote(media, uid, tile, dbg); } catch {}
         });
         remoteTilesRef.current.clear();
+      } catch {}
+
+      try {
+        const meId = client?.getCurrentUserInfo?.()?.userId;
+        if (meId && selfCanvasRef.current) {
+          media?.stopRenderVideo?.(selfCanvasRef.current, meId);
+        }
       } catch {}
 
       try { maybeAwait(media?.stopVideo?.()); } catch {}
       try { maybeAwait(media?.stopAudio?.()); } catch {}
       try { client?.leave?.(); } catch {}
-      try { clearAllIntervals(); } catch {}
 
       clientRef.current = null;
       mediaRef.current  = null;
@@ -521,7 +568,7 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
       await maybeAwait(media.startVideo({ deviceId: camId || undefined }));
 
       const parent = selfContainerRef.current;
-      await waitForNonZeroRect(parent, 'self.container.beforeRender', dbg, 2000, 60);
+      await waitForNonZeroRect(parent, 'self.container.beforeRender', dbg);
 
       const meId = client.getCurrentUserInfo()?.userId;
       const { w, h } = sizeOf(parent);
@@ -597,33 +644,31 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
   const handleEnable = async () => {
     setNeedsGesture(false);
     try { await maybeAwait(mediaRef.current?.startAudio()); setAudioOn(true); dbg('gesture.audio.ok'); } catch (e) { dbg('gesture.audio.fail', { err: niceErr(e) }); }
-    try { await startCam(); } catch {}
-
-    // kick remotes after user gesture (autoplay + layout)
-    try {
-      const stream = mediaRef.current;
-      remoteTilesRef.current.forEach((tile, uid) => {
-        const el = tile?.slot?.firstElementChild;
-        if (el) {
-          const { w, h } = sizeOf(tile.slot);
-          try { el.style.width = `${Math.max(1, w)}px`; el.style.height = `${Math.max(1, h)}px`; } catch {}
-          forcePlay(el, dbg, `post-gesture uid:${uid}`);
-        }
-      });
-      try { window.dispatchEvent(new Event('resize')); } catch {}
-    } catch {}
+    // No need to toggle cam automatically for patients; leave it on the button.
   };
 
   /* ---- UI ---- */
   return (
     <div style={{ width: '100%', height: '100%', display: 'grid', gridTemplateRows: 'auto 1fr', background: '#000', color: '#fff' }}>
-      <div style={{ padding: 12, display: 'flex', alignItems: 'center', gap: 10, background: 'rgba(255,255,255,.06)', borderBottom: '1px solid rgba(255,255,255,.07)' }}>
+      <div
+        className="meeting-toolbar"
+        style={{
+          padding: 12, display: 'flex', alignItems: 'center', gap: 10,
+          background: 'rgba(255,255,255,.06)', borderBottom: '1px solid rgba(255,255,255,.07)'
+        }}
+      >
         <strong style={{ letterSpacing: '.2px' }}>{locationName ? `Clinic – ${locationName}` : 'Clinic'}</strong>
 
         {cams.length > 1 && (
-          <select value={camId} onChange={(e) => setCamId(e.target.value)}
-                  style={{ marginLeft: 12, background: '#111', color: '#fff', borderRadius: 6, border: '1px solid #333', padding: '4px 8px' }}
-                  title="Camera">
+          <select
+            value={camId}
+            onChange={(e) => setCamId(e.target.value)}
+            title="Camera"
+            style={{
+              marginLeft: 12, background: '#111', color: '#fff', borderRadius: 6, border: '1px solid #333',
+              padding: '4px 8px', maxWidth: 180, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden'
+            }}
+          >
             {cams.map((c) => (<option key={c.deviceId} value={c.deviceId}>{c.label || 'Camera'}</option>))}
           </select>
         )}
@@ -691,7 +736,7 @@ export default function ZoomMeetingComponent({ callId, locationName, role = 0, u
       {needsGesture && (
         <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,.45)' }}>
           <button onClick={handleEnable} style={{ padding: '10px 14px', borderRadius: 8, border: 0, background: '#1f8fff', color: '#fff', fontWeight: 600 }}>
-            Enable audio & cam
+            Enable audio
           </button>
         </div>
       )}
