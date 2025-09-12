@@ -128,18 +128,47 @@ function ensureVideoPlayerCSS() {
 /* -------------- REMOTE rendering helpers -------------- */
 async function tryAttachV2(stream, uid, slotDiv, dbg) {
   const Q360 = (ZoomVideo?.VideoQuality?.Video_360P) ?? 2;
-  const el = await maybeAwait(stream.attachVideo(uid, Q360)); // v2 signature returns an element
-  if (!el || el.nodeType !== 1) throw new Error('attachVideo(v2) did not return an element');
 
+  // v2 attach returns the <video-player> element
+  const el = await maybeAwait(stream.attachVideo(uid, Q360));
+  if (!el || el.nodeType !== 1) {
+    throw new Error('attachVideo(v2) did not return an element');
+  }
+
+  // REQUIRED: Zoom's <video-player> must have a <video-player-container> ancestor
+  const container = document.createElement('video-player-container');
+  Object.assign(container.style, {
+    position: 'relative',
+    width: '100%',
+    height: '100%',
+    display: 'block',
+    background: '#111',
+  });
+
+  // mount container → then the player
   slotDiv.textContent = '';
-  slotDiv.appendChild(el);
+  slotDiv.appendChild(container);
+  container.appendChild(el);
+
+  // mobile autoplay friendliness
   makeAutoplayFriendly(el);
-  fillEl(el);
+
+  // sizing
+  fillEl(container); // fill the slot
+  try {
+    el.style.width = '100%';
+    el.style.height = '100%';
+    el.style.display = 'block';
+  } catch {}
+
   dbg('remote.attach.v2.ok', { uid, tag: el.tagName?.toLowerCase?.() });
-  // kick play on next frame (mobile)
+
+  // kick playback on next frame for mobile
   requestAnimationFrame(() => forcePlay(el, dbg, `uid:${uid}/v2attach`));
-  return el;
+
+  return el; // keep returning the inner <video-player>
 }
+
 
 async function renderRemoteCanvas(stream, uid, slotDiv, dbg) {
   const canvas = document.createElement('canvas');
